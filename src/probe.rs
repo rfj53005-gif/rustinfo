@@ -188,6 +188,13 @@ impl Prober {
                 readings: psi,
             });
         }
+        let pm = read_smu_pmtable();
+        if !pm.is_empty() {
+            chips.push(Chip {
+                name: "smu".into(),
+                readings: pm,
+            });
+        }
         chips.extend(read_smu());
         Ok(Snapshot {
             time: Local::now(),
@@ -833,6 +840,51 @@ fn read_psi() -> Vec<Reading> {
             });
         }
     }
+    out
+}
+
+/// 自研模块 rustinfo_smu 的 pm_table (debugfs, 每次 cat 触发全新传输)。
+/// 偏移来自 ryzenadj 上游 api.c 的 FAM_STRIXPOINT 字段映射
+/// (表版本 0x5D0009, 大小 0xD54), 并经本机 k10temp/RAPL/amdgpu 交叉验证。
+/// 0x98 附近 (cclk/socket_power) 存在二义性, 0x540+ 的 L3/GFX 温度字段单位
+/// 不明, 均不采信。
+fn read_smu_pmtable() -> Vec<Reading> {
+    const TABLE: &str = "/sys/kernel/debug/rustinfo_smu/table";
+    let Ok(raw) = fs::read(TABLE) else {
+        return Vec::new();
+    };
+    if raw.len() < 0x5B8 {
+        return Vec::new();
+    }
+    let f32v = |off: usize| -> Option<f64> {
+        let v = f32::from_le_bytes(raw[off..off + 4].try_into().ok()?);
+        v.is_finite().then_some(v as f64)
+    };
+    let mut out = Vec::new();
+    let mut push = |label: &str, off: usize, unit: Unit, scale: f64| {
+        if let Some(v) = f32v(off) {
+            if v != 0.0 {
+                out.push(Reading {
+                    label: label.into(),
+                    value: v * scale,
+                    unit,
+                });
+            }
+        }
+    };
+    push("stapm_limit", 0x00, Unit::Watts, 1.0);
+    push("stapm", 0x04, Unit::Watts, 1.0);
+    push("fast_limit", 0x08, Unit::Watts, 1.0);
+    push("fast", 0x0C, Unit::Watts, 1.0);
+    push("slow_limit", 0x10, Unit::Watts, 1.0);
+    push("slow", 0x14, Unit::Watts, 1.0);
+    push("apu_slow_limit", 0x18, Unit::Watts, 1.0);
+    push("tctl_limit", 0x58, Unit::TempC, 1.0);
+    push("tctl", 0x5C, Unit::TempC, 1.0);
+    push("psi0_limit", 0x40, Unit::Amps, 1.0);
+    push("psi0soc_limit", 0x48, Unit::Amps, 1.0);
+    push("gfx_clk", 0x5B4, Unit::Mhz, 1.0);
+    push("gfx_volt", 0x5A8, Unit::Volts, 1e-3);
     out
 }
 

@@ -110,7 +110,23 @@ sudo cat /sys/kernel/debug/rustinfo_smu/info    # 版本/基址/邮箱
 sudo cat /sys/kernel/debug/rustinfo_smu/table > table.bin   # 每次读都是新鲜数据
 ```
 
-安全说明:模块**只含四个只读命令**(0x02/0x06/0x66/0x65),不向固件发送任何写值命令(CO、限值碰都不碰);所有交互带超时、返回码校验、互斥锁串行化。模块是 `insmod` 手动加载的,**重启后消失**,验证稳定前不会放进开机流程。偏移表还在逆向中(见下)。
+安全说明:模块**只含四个只读命令**(0x02/0x06/0x66/0x65),不向固件发送任何写值命令(CO、限值碰都不碰);所有交互带超时、返回码校验、互斥锁串行化。模块是 `insmod` 手动加载的,**重启后消失**,验证稳定前不会放进开机流程。
+
+### 已验证字段(已接入 TUI/CSV,芯片名 `smu`)
+
+偏移来自 RyzenAdj 上游 `api.c` 的 FAM_STRIXPOINT 映射(表版本 `0x5D0009`,实际大小 `0xD54`),并经本机 k10temp / amdgpu PPT 同时刻交叉验证:
+
+| 偏移 | 字段 | 本机实测 |
+|---|---|---|
+| 0x00/0x04 | STAPM 限/当前值 | 65W / ~11W |
+| 0x08/0x0C | FAST 限/当前值 | 65W / ~10W |
+| 0x10/0x14 | SLOW 限/当前值 | 44W / ~11W |
+| 0x18 | APU SLOW 限 | 45W |
+| 0x58/0x5C | Tctl 温度墙/Tctl | 95°C / 56°C(与 k10temp 同源同值) |
+| 0x40/0x48 | PSI0/PSI0SOC 电流限 | 95A / 95A |
+| 0x5B4/0x5A8 | gfx_clk/gfx_volt | 400MHz / 0.87V(与 DPM 状态吻合) |
+
+不采信:0x98 附近(cclk_setpoint 与 socket_power 二义)、0x540+ 的 L3/GFX 温度(单位异常)。每核字段待逐核钉载差分逆向。
 
 ## 数据采集清单(Strix Point 实测)
 
