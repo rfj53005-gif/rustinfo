@@ -147,19 +147,20 @@ pub fn smu_table() -> Result<()> {
         bail!("传输命令返回 0x{ret:02X}");
     }
     let out = "/tmp/smu_pm_table.bin";
-    // 首选自研模块的 debugfs (内核 memremap 不受 IO_STRICT_DEVMEM 限制)
-    if let Ok(buf) = fs::read("/sys/kernel/debug/rustinfo_smu/table") {
-        fs::write(out, &buf).with_context(|| format!("写 {out}"))?;
-        println!("  经 rustinfo_smu 模块读取 {:#X} 字节 → {out}", buf.len());
+    let buf = if let Ok(b) = fs::read("/sys/kernel/debug/rustinfo_smu/table") {
+        // 首选自研模块的 debugfs (内核 memremap 不受 IO_STRICT_DEVMEM 限制)
+        println!("  经 rustinfo_smu 模块读取 {:#X} 字节 → {out}", b.len());
+        b
     } else {
         let devmem = File::open("/dev/mem").context("打开 /dev/mem 失败")?;
-        let mut buf = vec![0u8; len as usize];
-        if let Err(e) = devmem.read_exact_at(&mut buf, base) {
+        let mut b = vec![0u8; len as usize];
+        if let Err(e) = devmem.read_exact_at(&mut b, base) {
             bail!("/dev/mem 读取失败: {e} (IO_STRICT_DEVMEM 内核请先加载 module/rustinfo_smu.ko)");
         }
-        fs::write(out, &buf).with_context(|| format!("写 {out}"))?;
-        println!("  已读取 {len:#X} 字节 → {out}");
-    }
+        println!("  已读取 {:#X} 字节 → {out}", b.len());
+        b
+    };
+    fs::write(out, &buf).with_context(|| format!("写 {out}"))?;
 
     let f32v = |off: usize| f32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
     println!("\n已知偏移候选:");
