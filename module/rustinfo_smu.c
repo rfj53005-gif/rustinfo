@@ -16,10 +16,13 @@
 #include <linux/mm.h>
 #include <linux/io.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 
 #define SMN_ADDR_REG 0xC4
 #define SMN_DATA_REG 0xC8
 #define TABLE_SIZE   0x2000
+/* GetDramBase (0x66) 报告的保留区大小 (本机 0x1040000); 全量映射用于探索 */
+#define CARVEOUT_SIZE 0x1040000
 
 static struct pci_dev *smn_pdev;
 static DEFINE_MUTEX(smu_lock);
@@ -27,10 +30,12 @@ static DEFINE_MUTEX(smu_lock);
 /* 探测命中的邮箱 (SMN 地址) */
 static u32 mb_cmd, mb_rsp, mb_args;
 static u32 smu_ver, tbl_ver;
+static u32 smn_probe_val;
 static u64 dram_base;
 static void *mapped;
 static u8 *table_buf;
 static struct dentry *dbg;
+static u32 smn_probe_addr;
 
 /* 已知邮箱候选 (来自 ryzen_smu 各代号表, RSMU-APU 优先) */
 static const struct { u32 cmd, rsp, args; } mb_cands[] = {
@@ -152,9 +157,65 @@ static ssize_t info_read(struct file *filp, char __user *ubuf, size_t cnt,
 
 	n = scnprintf(buf, sizeof(buf),
 		      "smu_version=0x%08X\ntable_version=0x%06X\ndram_base=0x%llX\n"
-		      "mailbox: cmd=0x%X rsp=0x%X args=0x%X\ntable_bytes=%u\n",
+		      "mailbox: cmd=0x%X rsp=0x%X args=0x%X\ntable_bytes=%u\ncarveout_bytes=0x%X\n",
 		      smu_ver, tbl_ver, dram_base, mb_cmd, mb_rsp, mb_args,
-		      TABLE_SIZE);
+		      TABLE_SIZE, CARVEOUT_SIZE);
+	return simple_read_from_buffer(ubuf, cnt, ppos, buf, n);
+}
+
+/* carveout 全量只读转储 (不触发表传输; 偏移 0-0x2000 为最近一次刷新的 pm_table) */
+static ssize_t raw_read(struct file *filp, char __user *ubuf, size_t cnt,
+			loff_t *ppos)
+{
+	loff_t avail = CARVEOUT_SIZE;
+
+	if (!mapped)
+		return -ENODEV;
+	if (*ppos >= avail)
+		return 0;
+	if (cnt > avail - *ppos)
+		cnt = avail - *ppos;
+	if (copy_to_user(ubuf, (u8 *)mapped + *ppos, cnt))
+		return -EFAULT;
+	*ppos += cnt;
+	return cnt;
+}
+
+/* 任意 SMN 地址读取: echo <hex addr> > smn_addr; cat smn_val */
+static ssize_t smn_addr_write(struct file *filp, const char __user *ubuf,
+			      size_t cnt, loff_t *ppos)
+{
+	char kbuf[16];
+	int err;
+
+	if (cnt >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, ubuf, cnt))
+		return -EFAULT;
+	kbuf[cnt] = 0;
+	err = kstrtouint(strim(kbuf), 0, &smn_probe_addr);
+	if (err)
+		return err;
+	mutex_lock(&smu_lock);
+	err = smn_read(smn_probe_addr, &smn_probe_val);
+	mutex_unlock(&smu_lock);
+	return cnt;
+}
+
+static ssize_t smn_val_read(struct file *filp, char __user *ubuf, size_t cnt,
+			    loff_t *ppos)
+{
+	char buf[48];
+	int n;
+
+	mutex_lock(&smu_lock);
+	if (!smn_probe_addr) {
+		mutex_unlock(&smu_lock);
+		return 0;
+	}
+	n = scnprintf(buf, sizeof(buf), "0x%08X: 0x%08X (%u)\n",
+		      smn_probe_addr, smn_probe_val, smn_probe_val);
+	mutex_unlock(&smu_lock);
 	return simple_read_from_buffer(ubuf, cnt, ppos, buf, n);
 }
 
@@ -166,6 +227,21 @@ static const struct file_operations table_fops = {
 static const struct file_operations info_fops = {
 	.owner = THIS_MODULE,
 	.read = info_read,
+};
+
+static const struct file_operations raw_fops = {
+	.owner = THIS_MODULE,
+	.read = raw_read,
+};
+
+static const struct file_operations smn_addr_fops = {
+	.owner = THIS_MODULE,
+	.write = smn_addr_write,
+};
+
+static const struct file_operations smn_val_fops = {
+	.owner = THIS_MODULE,
+	.read = smn_val_read,
 };
 
 static int __init rustinfo_smu_init(void)
@@ -212,9 +288,9 @@ static int __init rustinfo_smu_init(void)
 		goto err_out;
 	}
 
-	mapped = memremap(dram_base, TABLE_SIZE, MEMREMAP_WB);
+	mapped = memremap(dram_base, CARVEOUT_SIZE, MEMREMAP_WB);
 	if (!mapped)
-		mapped = memremap(dram_base, TABLE_SIZE, MEMREMAP_WC);
+		mapped = memremap(dram_base, CARVEOUT_SIZE, MEMREMAP_WC);
 	if (!mapped) {
 		pr_err("rustinfo_smu: memremap 0x%llx 失败\n", dram_base);
 		ret = -ENOMEM;
@@ -236,6 +312,9 @@ static int __init rustinfo_smu_init(void)
 	dbg = debugfs_create_dir("rustinfo_smu", NULL);
 	debugfs_create_file("table", 0444, dbg, NULL, &table_fops);
 	debugfs_create_file("info", 0444, dbg, NULL, &info_fops);
+	debugfs_create_file("raw", 0444, dbg, NULL, &raw_fops);
+	debugfs_create_file("smn_addr", 0200, dbg, NULL, &smn_addr_fops);
+	debugfs_create_file("smn_val", 0444, dbg, NULL, &smn_val_fops);
 
 	pr_info("rustinfo_smu: SMU 0x%08X, 表版本 0x%06X, 基址 0x%llX, debugfs=/sys/kernel/debug/rustinfo_smu\n",
 		smu_ver, tbl_ver, dram_base);

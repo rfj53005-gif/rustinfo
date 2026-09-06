@@ -11,6 +11,23 @@ use crate::model::{
     BatterySnapshot, Chip, CpuSnapshot, MemSnapshot, Reading, Snapshot, Unit, VramSnapshot,
 };
 
+unsafe extern "C" {
+    fn ioctl(fd: i32, request: u64, ...) -> i32;
+}
+
+/// _IOWR('d', 0x40 + 0x05, struct drm_amdgpu_info)
+const DRM_IOCTL_AMDGPU_INFO: u64 = 0xC020_6445;
+const AMDGPU_INFO_SENSOR: u32 = 0x1D;
+
+#[repr(C)]
+struct DrmAmdgpuInfo {
+    return_pointer: u64,
+    return_size: u32,
+    query: u32,
+    sensor_type: u32,
+    _pad: [u32; 3],
+}
+
 const MSR_RAPL_POWER_UNIT: u64 = 0xC001_0299;
 const MSR_CORE_ENERGY: u64 = 0xC001_029A;
 
@@ -170,6 +187,13 @@ impl Prober {
             chips.push(Chip {
                 name: "rapl".into(),
                 readings: rapl,
+            });
+        }
+        let drm_sensors = read_drm_sensors();
+        if !drm_sensors.is_empty() {
+            chips.push(Chip {
+                name: "amdgpu-sensor".into(),
+                readings: drm_sensors,
             });
         }
         let dpm = read_amdgpu_dpm();
@@ -388,6 +412,54 @@ fn cpu_model() -> String {
                 .map(|(_, v)| v.trim().to_string())
         })
         .unwrap_or_else(|| "未知 CPU".into())
+}
+
+fn amdgpu_card_node() -> Option<String> {
+    for c in 0..8 {
+        if Path::new(&format!("/sys/class/drm/card{c}/device/mem_info_vram_total")).exists() {
+            return Some(format!("/dev/dri/card{c}"));
+        }
+    }
+    None
+}
+
+/// amdgpu DRM 传感器: ioctl 直读 SMU 实时值 (GFX/MCLK 时钟、负载、功率)
+/// 这是 pp_dpm_mclk 之外的细粒度实时频率来源 (nvtop 同款)
+fn read_drm_sensors() -> Vec<Reading> {
+    use std::fs::File;
+    use std::os::fd::AsRawFd;
+
+    let Some(node) = amdgpu_card_node() else { return Vec::new() };
+    let Ok(f) = File::open(&node) else { return Vec::new() };
+    let fd = f.as_raw_fd();
+
+    let mut info = DrmAmdgpuInfo {
+        return_pointer: 0,
+        return_size: 4,
+        query: AMDGPU_INFO_SENSOR,
+        sensor_type: 0,
+        _pad: [0; 3],
+    };
+
+    let mut out: Vec<Reading> = Vec::new();
+    macro_rules! sensor {
+        ($st:expr, $label:expr, $unit:expr, $scale:expr) => {{
+            info.sensor_type = $st;
+            let mut val: u32 = 0;
+            info.return_pointer = &mut val as *mut u32 as u64;
+            let ret = unsafe { ioctl(fd, DRM_IOCTL_AMDGPU_INFO, &mut info as *mut DrmAmdgpuInfo as u64) };
+            if ret == 0 {
+                out.push(Reading { label: $label.into(), value: val as f64 * $scale, unit: $unit });
+            }
+        }};
+    }
+    sensor!(1, "GfxClk", Unit::Mhz, 1.0);
+    sensor!(2, "MemClk", Unit::Mhz, 1.0);
+    sensor!(4, "Load", Unit::Pct, 1.0);
+    sensor!(5, "Power", Unit::Watts, 1.0);
+    sensor!(0xc, "InputPower", Unit::Watts, 1.0);
+    sensor!(3, "Temp", Unit::TempC, 0.001);
+    out
 }
 
 fn amdgpu_dev_path() -> Option<PathBuf> {
