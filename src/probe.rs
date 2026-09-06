@@ -885,6 +885,54 @@ fn read_smu_pmtable() -> Vec<Reading> {
     push("psi0soc_limit", 0x48, Unit::Amps, 1.0);
     push("gfx_clk", 0x5B4, Unit::Mhz, 1.0);
     push("gfx_volt", 0x5A8, Unit::Volts, 1e-3);
+
+    // 每核数组 (逐核钉载差分破译): 槽位映射 (硬件核号, 表槽), 槽 5/8 为硅片禁用位
+    const CORE_SLOTS: &[(u32, usize)] = &[
+        (0, 0),
+        (1, 1),
+        (2, 2),
+        (3, 3),
+        (8, 4),
+        (9, 6),
+        (10, 7),
+        (11, 9),
+        (12, 10),
+        (13, 11),
+    ];
+    if raw.len() >= 0x0CAC {
+        for (core, slot) in CORE_SLOTS {
+            let clk = f32v(0x0C1C + slot * 4);
+            let watt = f32v(0x09DC + slot * 4);
+            let vid = f32v(0x0C7C + slot * 4);
+            if let Some(v) = clk {
+                if v > 0.0 {
+                    out.push(Reading {
+                        label: format!("C{core:02}_clk"),
+                        value: v * 0.25,
+                        unit: Unit::Mhz,
+                    });
+                }
+            }
+            if let Some(v) = watt {
+                if v > 0.0 {
+                    out.push(Reading {
+                        label: format!("C{core:02}_w"),
+                        value: v,
+                        unit: Unit::Watts,
+                    });
+                }
+            }
+            if let Some(v) = vid {
+                if v > 0.0 {
+                    out.push(Reading {
+                        label: format!("C{core:02}_vid"),
+                        value: v,
+                        unit: Unit::Volts,
+                    });
+                }
+            }
+        }
+    }
     out
 }
 
