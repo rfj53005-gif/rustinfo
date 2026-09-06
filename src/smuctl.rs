@@ -57,6 +57,15 @@ pub fn run(args: &[String]) -> Result<()> {
             list();
             Ok(())
         }
+        Some("coper") if args.len() >= 3 => {
+            let core: u32 = args[1]
+                .parse()
+                .with_context(|| format!("核心号 \"{}\" 无效 (0-13, 硬件核号)", args[1]))?;
+            let val: i64 = args[2]
+                .parse()
+                .with_context(|| format!("值 \"{}\" 不是整数", args[2]))?;
+            set_coper(core, val)
+        }
         Some(name) => {
             let Some(v) = args.get(1) else {
                 bail!("缺少值: rustinfo smuctl {name} <值>   (list 查看全部消息)");
@@ -87,6 +96,27 @@ pub fn list() {
     println!("用法: rustinfo smuctl <名称> <值>");
     println!("示例: rustinfo smuctl co -27   |   rustinfo smuctl fclk-max 800");
     println!("所有写入均为易失状态, 重启回 BIOS 默认; 响应码实时校验 (OK/Failed/UnknownCmd/Rejected)。");
+}
+
+/// 单核 CO: 消息 0x4B, 编码 (core << 20) | (value & 0xFFFF) — g-helper 验证
+/// 注意: 只写不读 (pm_table 无每核 CO 读回), 值 0 = 恢复默认
+pub fn set_coper(core: u32, value: i64) -> Result<()> {
+    if core > 13 {
+        bail!("核心号 {core} 超范围 (本机硬件核号 0-3=Zen5, 8-13=Zen5c)");
+    }
+    if !(-32768i64..32768).contains(&value) {
+        bail!("CO 值 {value} 超出 16 位范围");
+    }
+    let enc = ((core & 0xF) << 20) | ((value as u32) & 0xFFFF);
+    let smn = Smn::open(BRIDGE.0, BRIDGE.1)?;
+    let (resp, _) = smn.send_command(REP, MSG, ARG, 0x4B, [enc, 0, 0, 0, 0, 0])?;
+    match resp {
+        1 => {
+            println!("✅ coper 核{core} ← {value} (编码 0x{enc:08X}) — SMU 响应 OK (只写, 无读回)");
+            Ok(())
+        }
+        r => bail!("SMU 响应: {}", match r { 0xFF => "Failed", 0xFE => "UnknownCmd", 0xFD => "RejectedPrereq", 0xFC => "Busy", x => return anyhow::bail!("0x{x:X}"), }),
+    }
 }
 
 pub fn set(name: &str, value: i64) -> Result<()> {

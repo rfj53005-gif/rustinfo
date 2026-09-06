@@ -16,6 +16,7 @@
 #include <linux/mm.h>
 #include <linux/io.h>
 #include <linux/slab.h>
+#include <linux/mm.h>
 #include <linux/string.h>
 
 #define SMN_ADDR_REG 0xC4
@@ -31,6 +32,8 @@ static DEFINE_MUTEX(smu_lock);
 static u32 mb_cmd, mb_rsp, mb_args;
 static u32 smu_ver, tbl_ver;
 static u32 smn_probe_val;
+static u32 smn_dump_start, smn_dump_len;
+static u8 *smn_dump_buf;
 static u64 dram_base;
 static void *mapped;
 static u8 *table_buf;
@@ -239,6 +242,67 @@ static const struct file_operations smn_addr_fops = {
 	.write = smn_addr_write,
 };
 
+static ssize_t smn_dump_write(struct file *filp, const char __user *ubuf,
+			      size_t cnt, loff_t *ppos)
+{
+	char kbuf[32];
+	u32 start, len;
+	int err;
+
+	if (cnt >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, ubuf, cnt))
+		return -EFAULT;
+	kbuf[cnt] = 0;
+	err = sscanf(strim(kbuf), "%x %x", &start, &len);
+	if (err != 2)
+		return -EINVAL;
+	if (len == 0 || len > 0x2000000 || len % 4)
+		return -EINVAL;
+
+	mutex_lock(&smu_lock);
+	kvfree(smn_dump_buf);
+	smn_dump_buf = kvzalloc(len, GFP_KERNEL);
+	if (!smn_dump_buf) {
+		smn_dump_len = 0;
+		mutex_unlock(&smu_lock);
+		return -ENOMEM;
+	}
+	smn_dump_start = start;
+	for (u32 off = 0; off < len; off += 4) {
+		u32 v = 0xFFFFFFFF;
+		smn_read(start + off, &v);
+		*(u32 *)(smn_dump_buf + off) = v;
+		cond_resched();
+	}
+	smn_dump_len = len;
+	mutex_unlock(&smu_lock);
+	return cnt;
+}
+
+static ssize_t smn_dump_read(struct file *filp, char __user *ubuf, size_t cnt,
+			     loff_t *ppos)
+{
+	loff_t avail = smn_dump_len;
+
+	if (!smn_dump_buf)
+		return -ENODATA;
+	if (*ppos >= avail)
+		return 0;
+	if (cnt > avail - *ppos)
+		cnt = avail - *ppos;
+	if (copy_to_user(ubuf, smn_dump_buf + *ppos, cnt))
+		return -EFAULT;
+	*ppos += cnt;
+	return cnt;
+}
+
+static const struct file_operations smn_dump_fops = {
+	.owner = THIS_MODULE,
+	.write = smn_dump_write,
+	.read = smn_dump_read,
+};
+
 static const struct file_operations smn_val_fops = {
 	.owner = THIS_MODULE,
 	.read = smn_val_read,
@@ -315,6 +379,7 @@ static int __init rustinfo_smu_init(void)
 	debugfs_create_file("raw", 0444, dbg, NULL, &raw_fops);
 	debugfs_create_file("smn_addr", 0200, dbg, NULL, &smn_addr_fops);
 	debugfs_create_file("smn_val", 0444, dbg, NULL, &smn_val_fops);
+	debugfs_create_file("smn_dump", 0600, dbg, NULL, &smn_dump_fops);
 
 	pr_info("rustinfo_smu: SMU 0x%08X, 表版本 0x%06X, 基址 0x%llX, debugfs=/sys/kernel/debug/rustinfo_smu\n",
 		smu_ver, tbl_ver, dram_base);
@@ -333,6 +398,7 @@ static void __exit rustinfo_smu_exit(void)
 	debugfs_remove_recursive(dbg);
 	if (mapped)
 		memunmap(mapped);
+	kvfree(smn_dump_buf);
 	kfree(table_buf);
 	pci_dev_put(smn_pdev);
 	pr_info("rustinfo_smu: 卸载\n");
