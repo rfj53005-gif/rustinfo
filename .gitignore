@@ -1,0 +1,12 @@
+target/
+
+# 内核模块构建产物
+module/*.ko
+module/*.mod
+module/*.mod.c
+module/*.o
+module/*.cmd
+module/Module.symvers
+module/Module.markers
+module/modules.order
+module/.tmp_versions/

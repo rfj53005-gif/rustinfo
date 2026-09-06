@@ -1,0 +1,921 @@
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use anyhow::Result;
+use chrono::Local;
+
+use crate::model::{
+    BatterySnapshot, Chip, CpuSnapshot, MemSnapshot, Reading, Snapshot, Unit, VramSnapshot,
+};
+
+const MSR_RAPL_POWER_UNIT: u64 = 0xC001_0299;
+const MSR_CORE_ENERGY: u64 = 0xC001_029A;
+
+/// 每物理核能量计数器 (MSR C001_029A): 32 位, 单位 2^-Esu J (Esu 在 C001_0299[12:8]),
+/// SMT 兄弟线程共享同一计数器, 核心进 CC6 时冻结。intel_rapl 驱动只在 lead CPU 上
+/// 把它注册成 sysfs 的 "core" 子域, 所以那个值是单核数据而非全核合计 —— 这里按核直读。
+struct MsrCore {
+    label: String,
+    file: File,
+    prev: Option<u32>,
+}
+
+struct MsrState {
+    cores: Vec<MsrCore>,
+    j_per_lsb: f64,
+}
+
+fn msr_read(cpu: usize, addr: u64) -> Option<u64> {
+    let f = File::open(format!("/dev/cpu/{cpu}/msr")).ok()?;
+    let mut buf = [0u8; 8];
+    f.read_exact_at(&mut buf, addr).ok()?;
+    Some(u64::from_le_bytes(buf))
+}
+
+impl MsrState {
+    fn init() -> Option<MsrState> {
+        let base = Path::new("/sys/devices/system/cpu");
+        let n = thread_count();
+        let mut groups: Vec<(String, usize)> = Vec::new();
+        let mut seen: HashMap<String, ()> = HashMap::new();
+        for i in 0..n {
+            let core_id = read_trimmed(&base.join(format!("cpu{i}/topology/core_id")))?;
+            let sibs = read_trimmed(&base.join(format!("cpu{i}/topology/thread_siblings_list")))?;
+            if seen.insert(sibs, ()).is_some() {
+                continue; // SMT 兄弟, 同一物理核
+            }
+            groups.push((format!("C{core_id:0>2}"), i));
+        }
+        let esu = ((msr_read(groups.first()?.1, MSR_RAPL_POWER_UNIT)? >> 8) & 0x1F) as i32;
+        let j_per_lsb = 2f64.powi(-esu);
+        let cores = groups
+            .into_iter()
+            .filter_map(|(label, cpu)| {
+                File::open(format!("/dev/cpu/{cpu}/msr"))
+                    .ok()
+                    .map(|file| MsrCore {
+                        label,
+                        file,
+                        prev: None,
+                    })
+            })
+            .collect();
+        Some(MsrState { cores, j_per_lsb })
+    }
+
+    fn power_watts(&mut self, dt: Option<f64>) -> Vec<Reading> {
+        let mut out = Vec::new();
+        for c in &mut self.cores {
+            let mut buf = [0u8; 8];
+            if c.file.read_exact_at(&mut buf, MSR_CORE_ENERGY).is_err() {
+                continue;
+            }
+            let cur = (u64::from_le_bytes(buf) & 0xFFFF_FFFF) as u32;
+            if let (Some(prev), Some(dt)) = (c.prev, dt) {
+                let de = cur.wrapping_sub(prev) as f64;
+                let w = de * self.j_per_lsb / dt;
+                if (0.0..200.0).contains(&w) {
+                    out.push(Reading {
+                        label: c.label.clone(),
+                        value: w,
+                        unit: Unit::Watts,
+                    });
+                }
+            }
+            c.prev = Some(cur);
+        }
+        out
+    }
+}
+
+fn read_trimmed(p: &Path) -> Option<String> {
+    fs::read_to_string(p).ok().map(|s| s.trim().to_string())
+}
+
+fn read_num<T: std::str::FromStr>(p: &Path) -> Option<T> {
+    read_trimmed(p)?.parse().ok()
+}
+
+pub struct Prober {
+    prev_idle: Option<u64>,
+    prev_total: Option<u64>,
+    prev_per: Vec<(u64, u64)>,
+    prev_rapl: HashMap<String, (u64, Instant, u64)>,
+    prev_disk: HashMap<String, (u64, u64, u64, Instant)>,
+    prev_net: HashMap<String, (u64, u64, Instant)>,
+    msr: Option<MsrState>,
+    last_snap: Option<Instant>,
+}
+
+impl Prober {
+    pub fn new() -> Self {
+        Self {
+            prev_idle: None,
+            prev_total: None,
+            prev_per: Vec::new(),
+            prev_rapl: HashMap::new(),
+            prev_disk: HashMap::new(),
+            prev_net: HashMap::new(),
+            msr: None,
+            last_snap: None,
+        }
+    }
+
+    pub fn snapshot(&mut self) -> Result<Snapshot> {
+        let now = Instant::now();
+        let dt = self
+            .last_snap
+            .take()
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .filter(|d| *d >= 0.05);
+        self.last_snap = Some(now);
+
+        let hostname = read_trimmed(Path::new("/proc/sys/kernel/hostname")).unwrap_or_default();
+        let kernel = read_trimmed(Path::new("/proc/sys/kernel/osrelease")).unwrap_or_default();
+        let (uptime_s, load) = read_uptime_load();
+        let (total_pct, per_pct) = self.cpu_usage();
+        let per_mhz = read_freqs(thread_count());
+        let mut rapl = rapl_zones(&mut self.prev_rapl);
+        if self.msr.is_none() {
+            self.msr = MsrState::init();
+        }
+        rapl.extend(self.msr.as_mut().map(|m| m.power_watts(dt)).unwrap_or_default());
+        let pkg_w = rapl
+            .iter()
+            .find(|r| r.label == "Package")
+            .map(|r| r.value);
+        let cpu = CpuSnapshot {
+            model: cpu_model(),
+            total_pct,
+            per_pct,
+            per_mhz,
+            pkg_w,
+            governor: read_trimmed(Path::new(
+                "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
+            ))
+            .unwrap_or_default(),
+            epp: read_trimmed(Path::new(
+                "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference",
+            ))
+            .unwrap_or_default(),
+        };
+        let mem = read_mem();
+        let (battery, ac_online) = read_battery_and_ac();
+        let vram = read_vram();
+        let mut chips = read_chips();
+        if !rapl.is_empty() {
+            chips.push(Chip {
+                name: "rapl".into(),
+                readings: rapl,
+            });
+        }
+        let dpm = read_amdgpu_dpm();
+        if !dpm.is_empty() {
+            chips.push(Chip {
+                name: "amdgpu-dpm".into(),
+                readings: dpm,
+            });
+        }
+        chips.extend(read_disk_io(&mut self.prev_disk));
+        chips.extend(read_net_io(&mut self.prev_net));
+        let psi = read_psi();
+        if !psi.is_empty() {
+            chips.push(Chip {
+                name: "psi".into(),
+                readings: psi,
+            });
+        }
+        chips.extend(read_smu());
+        Ok(Snapshot {
+            time: Local::now(),
+            hostname,
+            kernel,
+            uptime_s,
+            load,
+            cpu,
+            mem,
+            battery,
+            ac_online,
+            vram,
+            chips,
+        })
+    }
+
+    fn cpu_usage(&mut self) -> (f32, Vec<f32>) {
+        let Some((idle, total, per)) = read_stat() else {
+            return (0.0, Vec::new());
+        };
+        let total_pct = match (self.prev_idle, self.prev_total) {
+            (Some(pi), Some(pt)) => {
+                let dt = total.saturating_sub(pt) as f32;
+                let di = idle.saturating_sub(pi) as f32;
+                if dt > 0.0 {
+                    ((1.0 - di / dt) * 100.0).clamp(0.0, 100.0)
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
+        };
+        let mut per_pct = Vec::with_capacity(per.len());
+        for (i, (ci, ct)) in per.iter().enumerate() {
+            let p = match self.prev_per.get(i) {
+                Some((pi, pt)) => {
+                    let dt = ct.saturating_sub(*pt) as f32;
+                    let di = ci.saturating_sub(*pi) as f32;
+                    if dt > 0.0 {
+                        ((1.0 - di / dt) * 100.0).clamp(0.0, 100.0)
+                    } else {
+                        0.0
+                    }
+                }
+                None => 0.0,
+            };
+            per_pct.push(p);
+        }
+        self.prev_idle = Some(idle);
+        self.prev_total = Some(total);
+        self.prev_per = per;
+        (total_pct, per_pct)
+    }
+}
+
+impl Default for Prober {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RAPL Package 功率 (增量法); energy_uj 仅 root 可读。
+/// 只取 package 域: sysfs 的 "core" 子域实为 lead CPU 单核计数器
+/// (MSR C001_029A), 已由下方按核直读的每核功率取代。
+fn rapl_zones(prev: &mut HashMap<String, (u64, Instant, u64)>) -> Vec<Reading> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/powercap") else {
+        return out;
+    };
+    let mut zones: Vec<(String, String)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let dir = e.path();
+            let name = read_trimmed(&dir.join("name"))?;
+            if !name.contains("package") {
+                return None;
+            }
+            Some((dir.to_string_lossy().into_owned(), name))
+        })
+        .collect();
+    zones.sort();
+    for (dir, name) in zones {
+        let Some(cur) = read_num::<u64>(Path::new(&format!("{dir}/energy_uj"))) else {
+            continue;
+        };
+        let range =
+            read_num::<u64>(Path::new(&format!("{dir}/max_energy_range_uj"))).unwrap_or(u64::MAX);
+        let label = if name.contains("package") {
+            "Package".to_string()
+        } else {
+            name.clone()
+        };
+        let watts = match prev.get(&dir) {
+            Some((pe, at, prange)) => {
+                let dt = at.elapsed().as_secs_f64();
+                if dt >= 0.05 {
+                    let de = if cur >= *pe {
+                        cur - pe
+                    } else {
+                        prange.saturating_sub(*pe).saturating_add(cur)
+                    };
+                    let w = de as f64 / dt / 1e6;
+                    if (0.0..500.0).contains(&w) {
+                        Some(w)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        prev.insert(dir, (cur, Instant::now(), range));
+        if let Some(w) = watts {
+            out.push(Reading {
+                label,
+                value: w,
+                unit: Unit::Watts,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.label.cmp(&b.label));
+    out
+}
+
+fn read_stat() -> Option<(u64, u64, Vec<(u64, u64)>)> {
+    let s = fs::read_to_string("/proc/stat").ok()?;
+    let mut agg = None;
+    let mut per = Vec::new();
+    for line in s.lines() {
+        let Some(rest) = line.strip_prefix("cpu") else { continue };
+        let is_agg = rest.starts_with(' ');
+        if !is_agg && !rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let mut fields: Vec<u64> = rest
+            .split_whitespace()
+            .filter_map(|t| t.parse().ok())
+            .collect();
+        if !is_agg {
+            if fields.is_empty() {
+                continue;
+            }
+            fields.remove(0);
+        }
+        if fields.len() < 4 {
+            continue;
+        }
+        let idle = fields[3] + fields.get(4).copied().unwrap_or(0);
+        let total: u64 = fields.iter().sum();
+        if is_agg {
+            agg = Some((idle, total));
+        } else {
+            per.push((idle, total));
+        }
+    }
+    agg.map(|(i, t)| (i, t, per))
+}
+
+fn read_freqs(threads: usize) -> Vec<f32> {
+    (0..threads)
+        .map(|i| {
+            read_num::<f64>(Path::new(&format!(
+                "/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq"
+            )))
+            .map(|khz| (khz / 1000.0) as f32)
+            .unwrap_or(0.0)
+        })
+        .collect()
+}
+
+fn thread_count() -> usize {
+    let n = fs::read_to_string("/proc/cpuinfo")
+        .map(|s| s.lines().filter(|l| l.starts_with("processor")).count())
+        .unwrap_or(0);
+    if n > 0 {
+        n
+    } else {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    }
+}
+
+fn cpu_model() -> String {
+    fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("model name"))
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, v)| v.trim().to_string())
+        })
+        .unwrap_or_else(|| "未知 CPU".into())
+}
+
+fn amdgpu_dev_path() -> Option<PathBuf> {
+    for c in 0..8 {
+        let dev = PathBuf::from(format!("/sys/class/drm/card{c}/device"));
+        if dev.join("mem_info_vram_total").exists() {
+            return Some(dev);
+        }
+    }
+    None
+}
+
+fn read_mem() -> MemSnapshot {
+    let map: HashMap<String, u64> = fs::read_to_string("/proc/meminfo")
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| {
+                    let mut it = l.split_whitespace();
+                    let key = it.next()?.trim_end_matches(':').to_string();
+                    let val = it.next()?.parse().ok()?;
+                    Some((key, val))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    MemSnapshot {
+        total_kib: *map.get("MemTotal").unwrap_or(&0),
+        avail_kib: *map.get("MemAvailable").unwrap_or(&0),
+        swap_total_kib: *map.get("SwapTotal").unwrap_or(&0),
+        swap_free_kib: *map.get("SwapFree").unwrap_or(&0),
+    }
+}
+
+fn read_battery_and_ac() -> (Option<BatterySnapshot>, Option<bool>) {
+    let mut batt = None;
+    let mut ac = None;
+    let Ok(entries) = fs::read_dir("/sys/class/power_supply") else {
+        return (None, None);
+    };
+    for e in entries.flatten() {
+        let dir = e.path();
+        match read_trimmed(&dir.join("type")).unwrap_or_default().as_str() {
+            "Battery" if batt.is_none() => {
+                let status = read_trimmed(&dir.join("status")).unwrap_or_default();
+                let capacity_pct = read_num::<f64>(&dir.join("capacity"));
+                let volts = read_num::<f64>(&dir.join("voltage_now")).map(|v| v / 1e6);
+                let amps = read_num::<f64>(&dir.join("current_now")).map(|v| v / 1e6);
+                let watts = read_num::<f64>(&dir.join("power_now"))
+                    .map(|v| v / 1e6)
+                    .or_else(|| amps.zip(volts).map(|(a, v)| a * v));
+                let cycles = read_num::<u32>(&dir.join("cycle_count")).filter(|c| *c > 0);
+                let e_now = read_num::<f64>(&dir.join("energy_now"));
+                let e_full = read_num::<f64>(&dir.join("energy_full"));
+                let c_now = read_num::<f64>(&dir.join("charge_now"));
+                let c_full = read_num::<f64>(&dir.join("charge_full"));
+                let (energy_now_wh, energy_full_wh) = match (e_now, e_full) {
+                    (Some(a), Some(b)) => (Some(a / 1e6), Some(b / 1e6)),
+                    _ => match (c_now, c_full, volts) {
+                        (Some(a), Some(b), Some(v)) => (Some(a * v / 1e6), Some(b * v / 1e6)),
+                        _ => (None, None),
+                    },
+                };
+                // 健康度 = 满充容量 / 设计容量
+                let design = read_num::<f64>(&dir.join("charge_full_design"))
+                    .or_else(|| read_num::<f64>(&dir.join("energy_full_design")));
+                let health_pct = c_full
+                    .or(e_full)
+                    .zip(design)
+                    .filter(|(f, _)| *f > 0.0)
+                    .and_then(|(f, d)| {
+                        let h = f / d * 100.0;
+                        (1.0..150.0).contains(&h).then_some(h)
+                    });
+                // 续航估算: 剩余电荷 / 当前放电电流
+                let runtime_min = if status == "Discharging" {
+                    let now_ah = c_now
+                        .map(|v| v / 1e6)
+                        .or_else(|| e_now.zip(volts).map(|(e, v)| e / 1e6 / v));
+                    match now_ah.zip(amps) {
+                        Some((ah, a)) if a > 0.05 => {
+                            Some(((ah / a) * 60.0).clamp(0.0, 6000.0) as u64)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                batt = Some(BatterySnapshot {
+                    status,
+                    capacity_pct,
+                    volts,
+                    amps,
+                    watts,
+                    cycles,
+                    energy_now_wh,
+                    energy_full_wh,
+                    health_pct,
+                    runtime_min,
+                });
+            }
+            "Mains" | "USB" | "ADP" | "UPS" if ac.is_none() => {
+                ac = read_num::<u32>(&dir.join("online")).map(|v| v == 1);
+            }
+            _ => {}
+        }
+    }
+    (batt, ac)
+}
+
+fn read_vram() -> Option<VramSnapshot> {
+    let dev = amdgpu_dev_path()?;
+    let total_mib =
+        read_num::<f64>(&dev.join("mem_info_vram_total")).unwrap_or(0.0) / 1048576.0;
+    let used_mib = read_num::<f64>(&dev.join("mem_info_vram_used")).unwrap_or(0.0) / 1048576.0;
+    let gtt_used_mib = read_num::<f64>(&dev.join("mem_info_gtt_used")).map(|v| v / 1048576.0);
+    Some(VramSnapshot {
+        used_mib,
+        total_mib,
+        gtt_used_mib,
+    })
+}
+
+fn read_uptime_load() -> (f64, [f32; 3]) {
+    let uptime_s = fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0.0);
+    let mut load = [0.0f32; 3];
+    if let Some(l) = fs::read_to_string("/proc/loadavg").ok() {
+        for (i, v) in l.split_whitespace().take(3).enumerate() {
+            load[i] = v.parse().unwrap_or(0.0);
+        }
+    }
+    (uptime_s, load)
+}
+
+pub fn read_chips() -> Vec<Chip> {
+    let mut chips = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/hwmon") else {
+        return chips;
+    };
+    let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    for dir in dirs {
+        let Some(name) = read_trimmed(&dir.join("name")) else {
+            continue;
+        };
+        let Ok(files) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut nums: Vec<(String, u32)> = Vec::new();
+        for f in files.flatten() {
+            let fname = f.file_name().to_string_lossy().into_owned();
+            if let Some(rest) = fname.strip_prefix("pwm") {
+                if let Ok(n) = rest.parse::<u32>() {
+                    nums.push(("pwm".into(), n));
+                }
+                continue;
+            }
+            // 形如 temp1_input / in0_input / power1_average: 前缀 = 类别+序号
+            let Some(base) = fname.strip_suffix("_input") else {
+                continue;
+            };
+            let kind = base.trim_end_matches(|c: char| c.is_ascii_digit());
+            let Ok(n) = base[kind.len()..].parse::<u32>() else {
+                continue;
+            };
+            if !matches!(kind, "temp" | "in" | "curr" | "power" | "fan" | "energy") {
+                continue;
+            }
+            nums.push((kind.into(), n));
+        }
+        nums.sort();
+        nums.dedup();
+        let mut readings = Vec::new();
+        for (kind, n) in nums {
+            let (unit, scale) = match kind.as_str() {
+                "temp" => (Unit::TempC, 1000.0),
+                "in" => (Unit::Volts, 1000.0),
+                "curr" => (Unit::Amps, 1000.0),
+                "power" => (Unit::Watts, 1_000_000.0),
+                "fan" => (Unit::Rpm, 1.0),
+                "energy" => (Unit::Joules, 1_000_000.0),
+                _ => (Unit::Pct, 255.0),
+            };
+            let file = if kind == "pwm" {
+                format!("pwm{n}")
+            } else {
+                format!("{kind}{n}_input")
+            };
+            let Some(raw) = read_num::<f64>(&dir.join(&file)) else {
+                continue;
+            };
+            let label = if kind == "pwm" {
+                format!("pwm{n}")
+            } else {
+                read_trimmed(&dir.join(format!("{kind}{n}_label")))
+                    .unwrap_or_else(|| format!("{kind}{n}"))
+            };
+            readings.push(Reading {
+                label,
+                value: raw / scale,
+                unit,
+            });
+        }
+        if readings.is_empty() {
+            continue;
+        }
+        readings.sort_by(|a, b| a.label.cmp(&b.label));
+        chips.push(Chip { name, readings });
+    }
+    chips
+}
+
+/// amdgpu DPM 状态与占用率 (pp_dpm_* 中带 * 的是当前档位; 时钟门控时无标记, 报最高档 _max)
+fn read_amdgpu_dpm() -> Vec<Reading> {
+    let Some(dev) = amdgpu_dev_path() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (file, label) in [("gpu_busy_percent", "busy"), ("vcn_busy_percent", "vcn_busy")] {
+        if let Some(v) = read_num::<f64>(&dev.join(file)) {
+            out.push(Reading {
+                label: label.into(),
+                value: v,
+                unit: Unit::Pct,
+            });
+        }
+    }
+    for (file, label) in [
+        ("pp_dpm_sclk", "sclk"),
+        ("pp_dpm_mclk", "mclk"),
+        ("pp_dpm_socclk", "socclk"),
+        ("pp_dpm_fclk", "fclk"),
+        ("pp_dpm_vclk", "vclk"),
+        ("pp_dpm_dclk", "dclk"),
+        ("pp_dpm_dcefclk", "dcefclk"),
+    ] {
+        let Some(text) = read_trimmed(&dev.join(file)) else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        // 键名稳定: 当前档位恒为 {label} (门控时 0), 最高档恒为 {label}_max
+        let cur = dpm_current_line(&text);
+        let max = dpm_values(&text).into_iter().reduce(f64::max);
+        out.push(Reading {
+            label: label.into(),
+            value: cur.unwrap_or(0.0),
+            unit: Unit::Mhz,
+        });
+        if let Some(max) = max {
+            out.push(Reading {
+                label: format!("{label}_max"),
+                value: max,
+                unit: Unit::Mhz,
+            });
+        }
+    }
+    out
+}
+
+fn dpm_value_of(line: &str) -> Option<f64> {
+    line.split_once(':')?
+        .1
+        .trim()
+        .trim_end_matches('*')
+        .trim()
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn dpm_current_line(text: &str) -> Option<f64> {
+    text.lines()
+        .find(|l| l.contains('*'))
+        .and_then(dpm_value_of)
+}
+
+fn dpm_values(text: &str) -> Vec<f64> {
+    text.lines().filter_map(dpm_value_of).collect()
+}
+
+/// 块设备读写速率 (MiB/s) 与繁忙度 (%), delta 基于 /proc/diskstats
+fn read_disk_io(prev: &mut HashMap<String, (u64, u64, u64, Instant)>) -> Vec<Chip> {
+    let mut chips = Vec::new();
+    let Ok(s) = fs::read_to_string("/proc/diskstats") else {
+        return chips;
+    };
+    for line in s.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 14 {
+            continue;
+        }
+        let dev = f[2];
+        // 整盘 nvmeXnY, 排除分区 nvmeXnYpZ
+        if !(dev.starts_with("nvme") && !dev.contains('p')) {
+            continue;
+        }
+        let Ok(sec_r) = f[5].parse::<u64>() else { continue };
+        let Ok(sec_w) = f[9].parse::<u64>() else { continue };
+        let Ok(io_ticks) = f[12].parse::<u64>() else { continue };
+        let now = Instant::now();
+        let out = match prev.get(dev) {
+            Some((pr, pw, pt, at)) => {
+                let dt = at.elapsed().as_secs_f64();
+                if dt < 0.05 {
+                    None
+                } else {
+                    Some((
+                        sec_r.saturating_sub(*pr) as f64 * 512.0 / dt / 1048576.0,
+                        sec_w.saturating_sub(*pw) as f64 * 512.0 / dt / 1048576.0,
+                        (io_ticks.saturating_sub(*pt) as f64 / (dt * 1000.0) * 100.0)
+                            .clamp(0.0, 100.0),
+                    ))
+                }
+            }
+            None => None,
+        };
+        prev.insert(dev.to_string(), (sec_r, sec_w, io_ticks, now));
+        if let Some((r, w, busy)) = out {
+            chips.push(Chip {
+                name: format!("{dev} IO"),
+                readings: vec![
+                    Reading {
+                        label: "read".into(),
+                        value: r,
+                        unit: Unit::RateMBs,
+                    },
+                    Reading {
+                        label: "write".into(),
+                        value: w,
+                        unit: Unit::RateMBs,
+                    },
+                    Reading {
+                        label: "busy".into(),
+                        value: busy,
+                        unit: Unit::Pct,
+                    },
+                ],
+            });
+        }
+    }
+    chips
+}
+
+/// 网卡收发速率 (MiB/s) 与 Wi-Fi 信号 (dBm)
+fn read_net_io(prev: &mut HashMap<String, (u64, u64, Instant)>) -> Vec<Chip> {
+    let mut readings: Vec<Reading> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/net") else {
+        return Vec::new();
+    };
+    let mut ifaces: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    ifaces.sort();
+    for dir in ifaces {
+        let Some(name) = dir.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if name == "lo" {
+            continue;
+        }
+        seen.push(name.clone());
+        let rx = read_num::<u64>(&dir.join("statistics/rx_bytes")).unwrap_or(0);
+        let tx = read_num::<u64>(&dir.join("statistics/tx_bytes")).unwrap_or(0);
+        let now = Instant::now();
+        let rates = match prev.get(&name) {
+            Some((pr, pw, at)) => {
+                let dt = at.elapsed().as_secs_f64();
+                if dt < 0.05 {
+                    None
+                } else {
+                    Some((
+                        rx.saturating_sub(*pr) as f64 / dt / 1048576.0,
+                        tx.saturating_sub(*pw) as f64 / dt / 1048576.0,
+                    ))
+                }
+            }
+            None => None,
+        };
+        prev.insert(name.clone(), (rx, tx, now));
+        if let Some((r, w)) = rates {
+            readings.push(Reading {
+                label: format!("{name} down"),
+                value: r,
+                unit: Unit::RateMBs,
+            });
+            readings.push(Reading {
+                label: format!("{name} up"),
+                value: w,
+                unit: Unit::RateMBs,
+            });
+        }
+    }
+    // /proc/net/wireless: "wlp98s0: 0000 59. -51. -256 ..."
+    if let Ok(s) = fs::read_to_string("/proc/net/wireless") {
+        for line in s.lines().skip(2) {
+            let Some((name_raw, rest)) = line.split_once(':') else { continue };
+            let name = name_raw.trim();
+            if !seen.iter().any(|i| i == name) {
+                continue;
+            }
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            if let Some(dbm) = f.get(2).and_then(|v| v.parse::<f64>().ok()) {
+                readings.push(Reading {
+                    label: format!("{name} rssi"),
+                    value: dbm,
+                    unit: Unit::Dbm,
+                });
+            }
+        }
+    }
+    if readings.is_empty() {
+        Vec::new()
+    } else {
+        vec![Chip {
+            name: "net".into(),
+            readings,
+        }]
+    }
+}
+
+/// PSI 压力信息: 资源阻塞时间占比 (avg10, %)
+fn read_psi() -> Vec<Reading> {
+    let mut out = Vec::new();
+    for (file, name) in [("cpu", "cpu"), ("memory", "mem"), ("io", "io")] {
+        let Ok(s) = fs::read_to_string(format!("/proc/pressure/{file}")) else {
+            continue;
+        };
+        for line in s.lines() {
+            let Some((kind, rest)) = line.split_once(' ') else { continue };
+            let Some(avg10) = rest
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix("avg10="))
+            else {
+                continue;
+            };
+            let Ok(v) = avg10.parse::<f64>() else { continue };
+            let label = if kind == "some" {
+                name.to_string()
+            } else {
+                format!("{name}_full")
+            };
+            out.push(Reading {
+                label,
+                value: v,
+                unit: Unit::Pct,
+            });
+        }
+    }
+    out
+}
+
+/// ryzen_smu debugfs 遥测 (自动探测; 当前 Strix Point 尚无内核支持, 目录不存在则静默跳过)
+fn read_smu() -> Vec<Chip> {
+    let base = Path::new("/sys/kernel/debug/ryzen_smu");
+    if !base.is_dir() {
+        return Vec::new();
+    }
+    let mut scalars: Vec<Reading> = Vec::new();
+    for f in ["mclk", "fclk"] {
+        if let Some(v) = read_num::<f64>(&base.join(f)) {
+            scalars.push(Reading {
+                label: f.into(),
+                value: v,
+                unit: Unit::Mhz,
+            });
+        }
+    }
+    for (file, unit, scale) in [
+        ("power", Unit::Watts, 1000.0),   // 假定 mW
+        ("currents", Unit::Amps, 1000.0), // 假定 mA
+    ] {
+        if let Ok(s) = fs::read_to_string(base.join(file)) {
+            for line in s.lines() {
+                let Some((k, v)) = line.split_once(':') else { continue };
+                let Ok(raw) = v
+                    .trim()
+                    .trim_end_matches(char::is_alphabetic)
+                    .trim()
+                    .parse::<f64>()
+                else {
+                    continue;
+                };
+                scalars.push(Reading {
+                    label: k.trim().to_string(),
+                    value: raw / scale,
+                    unit,
+                });
+            }
+        }
+    }
+    let mut chips = Vec::new();
+    if !scalars.is_empty() {
+        chips.push(Chip {
+            name: "smu".into(),
+            readings: scalars,
+        });
+    }
+    if let Ok(s) = fs::read_to_string(base.join("cores")) {
+        let mut per_core: Vec<(String, f64, Unit)> = Vec::new();
+        for line in s.lines() {
+            let mut core_idx: Option<u32> = None;
+            let mut pairs: Vec<(String, f64, Unit)> = Vec::new();
+            for part in line.split(',') {
+                let Some((k, v)) = part.split_once(':') else { continue };
+                let k = k.trim().to_ascii_lowercase();
+                let Ok(num) = v.trim().parse::<f64>() else { continue };
+                match k.as_str() {
+                    "core" => core_idx = Some(num as u32),
+                    "tmp" | "temp" => pairs.push(("Temp".into(), num, Unit::TempC)),
+                    "vid" | "voltage" => pairs.push(("VID".into(), num, Unit::Volts)),
+                    "clock" | "clk" | "fid" => {
+                        pairs.push(("Clock".into(), num, Unit::Mhz))
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(n) = core_idx {
+                for (k, v, u) in pairs {
+                    per_core.push((format!("C{n:02}_{k}"), v, u));
+                }
+            }
+        }
+        if !per_core.is_empty() {
+            chips.push(Chip {
+                name: "smu-cores".into(),
+                readings: per_core
+                    .into_iter()
+                    .map(|(label, value, unit)| Reading { label, value, unit })
+                    .collect(),
+            });
+        }
+    }
+    chips
+}

@@ -1,0 +1,14 @@
+[package]
+name = "rustinfo"
+version = "0.1.0"
+edition = "2021"
+description = "HWiNFO-style Linux hardware monitor in Rust (sysfs/procfs native, TUI + CSV logging)"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+ratatui = "0.29"
+
+[profile.release]
+lto = "thin"
+strip = true
