@@ -1,6 +1,7 @@
 mod logger;
 mod model;
 mod probe;
+mod smuctl;
 mod smu;
 mod ui;
 
@@ -54,6 +55,7 @@ fn run(args: &[String]) -> Result<()> {
         "log" => run_log(positional.get(1).cloned(), interval),
         "smu-probe" => smu::probe(),
         "smu-table" => smu::smu_table(),
+        "smuctl" => smuctl::run(&positional[1..]),
         other => {
             eprintln!("未知子命令: {other}");
             print_help();
@@ -77,6 +79,9 @@ fn print_help() {
     println!("  tui           实时终端面板 (默认)");
     println!("  dump          打印一次所有读数后退出");
     println!("  log [文件]    无界面 CSV 记录, Ctrl-C 结束 (默认 rustinfo_时间戳.csv)");
+    println!("  smu-probe     SMU 邮箱通道探测");
+    println!("  smu-table     抓取 SMU pm_table 遥测");
+    println!("  smuctl        SMU 直控 (替代 ryzenadj): smuctl list | smuctl <名称> <值>");
     println!();
     println!("按键 (tui): q 退出 │ 空格 暂停 │ l CSV记录 │ +/- 调整采样间隔");
 }

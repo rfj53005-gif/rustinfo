@@ -23,14 +23,14 @@ const MAILBOXES: &[(&str, u32, u32, u32)] = &[
     ("RSMU-TR", 0x3B10_51C, 0x3B10_568, 0x3B10_590),
 ];
 
-struct Smn {
+pub struct Smn {
     cfg: File,
     idx_reg: u64,
     data_reg: u64,
 }
 
 impl Smn {
-    fn open(idx_reg: u64, data_reg: u64) -> Result<Self> {
+    pub fn open(idx_reg: u64, data_reg: u64) -> Result<Self> {
         let cfg = OpenOptions::new()
             .read(true)
             .write(true)
@@ -43,21 +43,21 @@ impl Smn {
         })
     }
 
-    fn smn_read(&self, addr: u32) -> Result<u32> {
+    pub fn smn_read(&self, addr: u32) -> Result<u32> {
         self.cfg.write_at(&addr.to_le_bytes(), self.idx_reg)?;
         let mut b = [0u8; 4];
         self.cfg.read_exact_at(&mut b, self.data_reg)?;
         Ok(u32::from_le_bytes(b))
     }
 
-    fn smn_write(&self, addr: u32, val: u32) -> Result<()> {
+    pub fn smn_write(&self, addr: u32, val: u32) -> Result<()> {
         self.cfg.write_at(&addr.to_le_bytes(), self.idx_reg)?;
         self.cfg.write_at(&val.to_le_bytes(), self.data_reg)?;
         Ok(())
     }
 
     /// ryzen_smu 六步握手: 等 RSP 非零 → 清零 → 写参数 → 写命令 → 等 RSP → 读参数
-    fn send_command(
+    pub fn send_command(
         &self,
         rsp: u32,
         cmd: u32,

@@ -27,7 +27,10 @@ cat > "$HOME/.local/bin/rustinfo" <<'EOF'
 #!/bin/sh
 BIN=/usr/local/bin/rustinfo
 [ "$(id -u)" -eq 0 ] && exec "$BIN" "$@"
-exec sudo -n "$BIN" "$@" 2>/dev/null || exec "$BIN" "$@"
+if sudo -n -l "$BIN" >/dev/null 2>&1; then
+    exec sudo -n "$BIN" "$@"
+fi
+exec "$BIN" "$@"
 EOF
 chmod +x "$HOME/.local/bin/rustinfo"
 

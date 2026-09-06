@@ -142,6 +142,33 @@ sudo cat /sys/kernel/debug/rustinfo_smu/table > table.bin   # 每次读都是新
 
 另发现 **STAPM/FAST/SLOW 限值是动态的**(同一台机器 65W → 56W,随电池/热状态由固件调整)——对降压验证来说,这意味着限值也应该进 CSV 监控(已进)。
 
+## smuctl:SMU 直控(替代 ryzenadj,Zen 5 实测)
+
+`smuctl` 是本项目的 SMU 直控子命令,通过自研 RSMU/MP1 邮箱通道(Strix Point: cmd `0x3B10928` / rsp `0x3B10978` / args `0x3B10998`,SMN 桥走 00:00.0 config `0xB8`/`0xBC`)直接发送 PMFW 消息,对 AMD Zen 5 移动平台(family 0x1A:Strix Point / Strix Halo / Krackan Point)提供 ryzenadj 缺失或已损坏的能力:
+
+| 能力 | ryzenadj 0.19 | rustinfo smuctl |
+|---|---|---|
+| 全核 CO(`--set-coall`) | ✅ 但需手写 28 位补码 `0xfffffe5` | ✅ 直接写 `-27`,自动编码 + **arg0 读回确认** |
+| pm_table 遥测(`--dump-table`) | ❌ 被 IO_STRICT_DEVMEM 拦截(无法初始化) | ✅ `smu-table` + 只读内核模块(memremap) |
+| 每核功率 / 时钟 / VID | ❌ | ✅ 逐核钉载差分破译,已接入 TUI/CSV |
+| FCLK 软上限 / 硬下限 | ❌ "not supported on this family" | ✅ `fclk-max` / `fclk-min`(0x1E / 0x23,本机实测生效) |
+| PPT/STAPM/TDC/EDC/温度墙 | ✅ | ✅ 同一消息表(0x14-0x1D、0x19) |
+| 写入结果反馈 | "Successfully set" 不可信(被拒时才提示) | 每次写入实时校验响应码(OK / Failed / UnknownCmd / RejectedPrereq / Busy) |
+
+```bash
+sudo rustinfo smuctl list          # 全部消息手册 (20 条, 含单位与语义备注)
+sudo rustinfo smuctl co -27        # 全核 CO -27 (自动 28 位补码编码, 无需手写 0xfffffe5)
+sudo rustinfo smuctl fclk-max 800  # FCLK 软上限 (省电场景)
+sudo rustinfo smuctl stapm-limit 25000
+```
+
+已知坑与语义备注:
+
+- **CO 是 28 位补码**:-27 → `0x0FFFFFE5`;按 32 位直觉写 `0xFFFFFFE5` 会被 PMFW 拒绝(Failed)——ryzenadj 未文档化的坑,smuctl 自动处理。
+- `0x23` 语义:ryzenadj 映射为 apu-slow-limit;判别实验(45000 被接受且不钉频)显示它接受任意数值,域语义待定,使用前自行评估。
+- 所有写入均为易失状态,重启回 BIOS 默认;持久化走 systemd + 浸泡验证铁律。
+- GPU CO(PSMU 邮箱 0xB7,Phoenix/Hawk Point 可用)在 Strix Point 上的存在性未验证。
+
 ## 数据采集清单(Strix Point 实测)
 
 - **CPU**:每线程占用/实时频率、总占用、RAPL Package 功率、每物理核功率(MSR C001_029A,标签 C00-C03 为 Zen5 大核、C08-C13 为 Zen5c 核——编号跳过 4-7 是硬件拓扑,不是 bug)
