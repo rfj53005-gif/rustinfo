@@ -167,7 +167,7 @@ sudo rustinfo smuctl stapm-limit 25000
 - **CO 是 28 位补码**:-27 → `0x0FFFFFE5`;按 32 位直觉写 `0xFFFFFFE5` 会被 PMFW 拒绝(Failed)——ryzenadj 未文档化的坑,smuctl 自动处理。
 - `0x23` 语义:ryzenadj 映射为 apu-slow-limit;判别实验(45000 被接受且不钉频)显示它接受任意数值,域语义待定,使用前自行评估。
 - 所有写入均为易失状态,重启回 BIOS 默认;持久化走 systemd + 浸泡验证铁律。
-- GPU CO(PSMU 邮箱 0xB7,Phoenix/Hawk Point 可用)在 Strix Point 上的存在性未验证。
+- GPU CO(PSMU 邮箱 0xB7):Strix Point 上**消息存在但被前置条件锁死**——判别实验:0xB7 返回 RejectedPrereq(非 UnknownCmd,说明消息有效),enable-oc 在 MP1/PSMU 两侧、GPU 活跃/空闲状态下均无法解锁,与 Strix Halo 的平台限制(#387)同模式,疑似 OEM 固件锁。
 
 ## 数据采集清单(Strix Point 实测)
 
