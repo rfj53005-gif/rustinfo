@@ -273,7 +273,9 @@ static ssize_t smn_dump_write(struct file *filp, const char __user *ubuf,
 		u32 v = 0xFFFFFFFF;
 		smn_read(start + off, &v);
 		*(u32 *)(smn_dump_buf + off) = v;
-		cond_resched();
+		udelay(1);            /* 节流: 背靠背访问会打断 SMN 桥 */
+		if ((off & 0xFFFF) == 0)
+			cond_resched();
 	}
 	smn_dump_len = len;
 	mutex_unlock(&smu_lock);
