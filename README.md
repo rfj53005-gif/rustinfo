@@ -151,21 +151,21 @@ sudo cat /sys/kernel/debug/rustinfo_smu/table > table.bin   # 每次读都是新
 | 全核 CO(`--set-coall`) | ✅ 但需手写 28 位补码 `0xfffffe5` | ✅ 直接写 `-27`,自动编码 + **arg0 读回确认** |
 | pm_table 遥测(`--dump-table`) | ❌ 被 IO_STRICT_DEVMEM 拦截(无法初始化) | ✅ `smu-table` + 只读内核模块(memremap) |
 | 每核功率 / 时钟 / VID | ❌ | ✅ 逐核钉载差分破译,已接入 TUI/CSV |
-| FCLK 软上限 / 硬下限 | ❌ "not supported on this family" | ✅ `fclk-max` / `fclk-min`(0x1E / 0x23,本机实测生效) |
+| PSI0 电流限制 / APU 慢速功耗墙 | ❌ ryzenadj 无此接口 | ✅ `psi0-current` / `apu-slow-limit`(0x1E / 0x23,判别实验实锤) |
 | PPT/STAPM/TDC/EDC/温度墙 | ✅ | ✅ 同一消息表(0x14-0x1D、0x19) |
 | 写入结果反馈 | "Successfully set" 不可信(被拒时才提示) | 每次写入实时校验响应码(OK / Failed / UnknownCmd / RejectedPrereq / Busy) |
 
 ```bash
 sudo rustinfo smuctl list          # 全部消息手册 (20 条, 含单位与语义备注)
 sudo rustinfo smuctl co -27        # 全核 CO -27 (自动 28 位补码编码, 无需手写 0xfffffe5)
-sudo rustinfo smuctl fclk-max 800  # FCLK 软上限 (省电场景)
+sudo rustinfo smuctl psi0-current 45000  # PSI0 电流上限 (45A = 不设限)
 sudo rustinfo smuctl stapm-limit 25000
 ```
 
 已知坑与语义备注:
 
 - **CO 是 28 位补码**:-27 → `0x0FFFFFE5`;按 32 位直觉写 `0xFFFFFFE5` 会被 PMFW 拒绝(Failed)——ryzenadj 未文档化的坑,smuctl 自动处理。
-- `0x23` 语义:ryzenadj 映射为 apu-slow-limit;判别实验(45000 被接受且不钉频)显示它接受任意数值,域语义待定,使用前自行评估。
+- `0x1E`/`0x23` 语义判别:UXTU 映射 psi0-current / apu-slow-limit;ryzenadj 与内核 SMU14 头的 FCLK 说法均为误映射(判别实验:45000 被接受且不钉频、不限功耗)。
 - 所有写入均为易失状态,重启回 BIOS 默认;持久化走 systemd + 浸泡验证铁律。
 - GPU CO(PSMU 邮箱 0xB7):Strix Point 上**消息存在但被前置条件锁死**——判别实验:0xB7 返回 RejectedPrereq(非 UnknownCmd,说明消息有效),enable-oc 在 MP1/PSMU 两侧、GPU 活跃/空闲状态下均无法解锁,与 Strix Halo 的平台限制(#387)同模式,疑似 OEM 固件锁。
 
