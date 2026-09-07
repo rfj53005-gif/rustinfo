@@ -5,7 +5,7 @@
 
 use anyhow::{bail, Context, Result};
 
-use crate::smu::Smn;
+use crate::smu::{require_supported_cpu, Smn};
 
 /// RSMU MP1 邮箱 (ryzenadj STRIXPOINT 三件套, CO/FCLK 均实测验证)
 const MSG: u32 = 0x3B10_928;
@@ -70,11 +70,24 @@ pub fn run(args: &[String]) -> Result<()> {
             let Some(v) = args.get(1) else {
                 bail!("缺少值: rustinfo smuctl {name} <值>   (list 查看全部消息)");
             };
-            let val: i64 = v
-                .parse()
-                .with_context(|| format!("值 \"{v}\" 不是整数 (CO 负值直接写 -27)"))?;
-            set(name, val)
+            let (val, hex) = parse_val(v)?;
+            set(name, val, hex)
         }
+    }
+}
+
+/// 值解析: 0x 前缀 = 原始 arg 十六进制直通 (脚本/ryzenadj 文档里的编码值,
+/// 如 0x0FFFFFE5); 否则十进制有符号整数 (CO 负值直接写 -27)
+fn parse_val(s: &str) -> Result<(i64, bool)> {
+    if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        let v = u32::from_str_radix(h, 16)
+            .with_context(|| format!("值 \"{s}\" 不是合法十六进制"))?;
+        Ok((v as i64, true))
+    } else {
+        let v: i64 = s
+            .parse()
+            .with_context(|| format!("值 \"{s}\" 不是整数 (CO 负值直接写 -27, 原始 arg 用 0x 前缀)"))?;
+        Ok((v, false))
     }
 }
 
@@ -94,13 +107,14 @@ pub fn list() {
     }
     println!();
     println!("用法: rustinfo smuctl <名称> <值>");
-    println!("示例: rustinfo smuctl co -27   |   rustinfo smuctl fclk-max 800");
+    println!("示例: rustinfo smuctl co -27   |   rustinfo smuctl co 0x0FFFFFE5 (等价, 原始 arg 直通)   |   rustinfo smuctl stapm-limit 20000");
     println!("所有写入均为易失状态, 重启回 BIOS 默认; 响应码实时校验 (OK/Failed/UnknownCmd/Rejected)。");
 }
 
 /// 单核 CO: 消息 0x4B, 编码 (core << 20) | (value & 0xFFFF) — g-helper 验证
 /// 注意: 只写不读 (pm_table 无每核 CO 读回), 值 0 = 恢复默认
 pub fn set_coper(core: u32, value: i64) -> Result<()> {
+    require_supported_cpu()?;
     if core > 13 {
         bail!("核心号 {core} 超范围 (本机硬件核号 0-3=Zen5, 8-13=Zen5c)");
     }
@@ -119,7 +133,8 @@ pub fn set_coper(core: u32, value: i64) -> Result<()> {
     }
 }
 
-pub fn set(name: &str, value: i64) -> Result<()> {
+pub fn set(name: &str, value: i64, hex: bool) -> Result<()> {
+    require_supported_cpu()?;
     let Some(c) = find(name) else {
         bail!(
             "未知消息 \"{name}\" — 用 `rustinfo smuctl list` 查看全部 ({})",
@@ -127,14 +142,17 @@ pub fn set(name: &str, value: i64) -> Result<()> {
         );
     };
     let raw: u32 = if c.id == 0x4C || c.id == 0x4B {
-        // CO 走 28 位补码: -27 → 0x0FFFFFE5 (32 位补码 0xFFFFFFE5 会被 SMU 拒绝)
-        if !(-(1i64 << 27)..(1i64 << 27)).contains(&value) {
-            bail!("CO 值 {value} 超出 28 位补码范围 (±134217728)");
-        }
-        if value < 0 {
-            (value + (1i64 << 28)) as u32
+        if hex {
+            value as u32 // 0x 前缀 = 原始 arg 直通 (如 0x0FFFFFE5 ≡ co -27)
+        } else if (-(1i64 << 27)..(1i64 << 28)).contains(&value) {
+            // 负值 = 28 位补码 CO; [0, 2^27) = 正向 CO; [2^27, 2^28) 不可能是名义 CO, 视为原始 arg
+            if value < 0 {
+                (value + (1i64 << 28)) as u32
+            } else {
+                value as u32
+            }
         } else {
-            value as u32
+            bail!("CO 值 {value} 超范围: 名义值 ±2^27, 原始 arg < 2^28 (可用 0x 前缀十六进制)");
         }
     } else {
         value as u32 // 其余消息 (mW/mA/MHz/s) 为普通正数
