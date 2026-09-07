@@ -164,7 +164,8 @@ sudo rustinfo smuctl stapm-limit 25000
 
 已知坑与语义备注:
 
-- **CO 是 28 位补码**:-27 → `0x0FFFFFE5`;按 32 位直觉写 `0xFFFFFFE5` 会被 PMFW 拒绝(Failed)——ryzenadj 未文档化的坑,smuctl 自动处理。
+- **平台守卫**:smu-probe / smu-table / smuctl 写路径默认只在 CPU family 26 (0x1A) 上运行,其他平台直接拒绝(邮箱 SMN 地址按 family 硬编码,误写有硬件风险);自负风险可用 `RUSTINFO_SMU_FORCE=1` 跳过。
+- **CO 是 28 位补码**:-27 → `0x0FFFFFE5`;按 32 位直觉写 `0xFFFFFFE5` 会被 PMFW 拒绝(Failed)——ryzenadj 未文档化的坑,smuctl 自动处理。`0x` 前缀值按原始 arg 直通(如 `co 0x0FFFFFE5` ≡ `co -27`)。
 - `0x1E`/`0x23` 语义判别:UXTU 映射 psi0-current / apu-slow-limit;ryzenadj 与内核 SMU14 头的 FCLK 说法均为误映射(判别实验:45000 被接受且不钉频、不限功耗)。
 - 所有写入均为易失状态,重启回 BIOS 默认;持久化走 systemd + 浸泡验证铁律。
 - GPU CO(PSMU 邮箱 0xB7):Strix Point 上**消息存在但被前置条件锁死**——判别实验:0xB7 返回 RejectedPrereq(非 UnknownCmd,说明消息有效),enable-oc 在 MP1/PSMU 两侧、GPU 活跃/空闲状态下均无法解锁,与 Strix Halo 的平台限制(#387)同模式,疑似 OEM 固件锁。
