@@ -103,10 +103,36 @@ fn version_str(v: u32) -> String {
     format!("{}.{}.{}", (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff)
 }
 
+/// SMU 探针/直控仅限 CPU family 26 (0x1A, Zen 5 移动: Strix/Krackan/Strix Halo) —
+/// 邮箱 SMN 地址与消息表按该家族硬编码, 其他平台误写这些地址有硬件风险。
+/// 自负风险跳过: RUSTINFO_SMU_FORCE=1
+pub fn require_supported_cpu() -> Result<()> {
+    if std::env::var_os("RUSTINFO_SMU_FORCE").is_some_and(|v| v == "1") {
+        return Ok(());
+    }
+    let s = fs::read_to_string("/proc/cpuinfo").context("读 /proc/cpuinfo")?;
+    let fam = s.lines().find_map(|l| {
+        l.strip_prefix("cpu family")?
+            .split(':')
+            .nth(1)?
+            .trim()
+            .parse::<u32>()
+            .ok()
+    });
+    match fam {
+        Some(26) => Ok(()),
+        Some(f) => bail!(
+            "CPU family {f} (0x{f:X}) 未验证 — smu/smuctl 的邮箱与消息表仅适配 family 26 (0x1A, Zen 5 移动)。确要尝试: RUSTINFO_SMU_FORCE=1"
+        ),
+        None => bail!("无法识别 CPU family。确要尝试: RUSTINFO_SMU_FORCE=1"),
+    }
+}
+
 /// pm_table 抓取: 版本 → DRAM 基址 → 触发传输 → /dev/mem 只读读取。
 /// 只用 APU 类(Renoir/Cezanne 系)已文档化的三个只读命令号,
 /// 任何一个返回 UnknownCmd 就停下, 不盲试其他命令号。
 pub fn smu_table() -> Result<()> {
+    require_supported_cpu()?;
     let smn = Smn::open(0xC4, 0xC8)?;
     const CMD: u32 = 0x3B10_A20; // RSMU-APU (探针已验证)
     const RSP: u32 = 0x3B10_A80;
@@ -142,16 +168,17 @@ pub fn smu_table() -> Result<()> {
     }
 
     println!("== 4/4 表传输 (cmd 0x65) + 只读读取 ==");
-    let (ret, _) = smn.send_command(RSP, CMD, ARGS, 0x65, [0; 6])?;
-    if ret != 0x01 {
-        bail!("传输命令返回 0x{ret:02X}");
-    }
     let out = "/tmp/smu_pm_table.bin";
     let buf = if let Ok(b) = fs::read("/sys/kernel/debug/rustinfo_smu/table") {
-        // 首选自研模块的 debugfs (内核 memremap 不受 IO_STRICT_DEVMEM 限制)
+        // 自研模块: read 内部已触发全新传输 (table_refresh), 不要再从用户态发 0x65 —
+        // 双发会与模块的六步握手竞争同一 SMN 桥/邮箱, 偶发超时 (实测 ~1/3 失败率)
         println!("  经 rustinfo_smu 模块读取 {:#X} 字节 → {out}", b.len());
         b
     } else {
+        let (ret, _) = smn.send_command(RSP, CMD, ARGS, 0x65, [0; 6])?;
+        if ret != 0x01 {
+            bail!("传输命令返回 0x{ret:02X}");
+        }
         let devmem = File::open("/dev/mem").context("打开 /dev/mem 失败")?;
         let mut b = vec![0u8; len as usize];
         if let Err(e) = devmem.read_exact_at(&mut b, base) {
@@ -170,6 +197,12 @@ pub fn smu_table() -> Result<()> {
         let o = row * 16;
         let hex: Vec<String> = buf[o..o + 16].iter().map(|b| format!("{b:02X}")).collect();
         println!("  {o:04X}: {}  {}", hex.join(" "), hex_f32(&buf, o));
+    }
+    // 全表转储: "0xOFFSET value" 每行一个 f32, 供脚本 awk '$1 ~ /^0x/' 解析
+    // (替代 ryzenadj --dump-table; 0x007C=VDDCR, 0x0000/0x0008/0x0010=stapm/fast/slow limit)
+    println!("\n全表 f32 转储 ({} 字节):", buf.len());
+    for off in (0..buf.len() - 3).step_by(4) {
+        println!("0x{off:04X} {}", f32v(off));
     }
     println!("\n用 ryzenadj --dump-table 对照同偏移即可验证; 非零 float 密集区即遥测区。");
     Ok(())
@@ -207,6 +240,7 @@ fn iomem_region(base: u64) -> Result<(String, u64)> {
 }
 
 pub fn probe() -> Result<()> {
+    require_supported_cpu()?;
     println!("SMU 邮箱探针 — 只发只读命令 0x02 (GetSMUVersion), 命中即停");
     for (idx_reg, data_reg) in SMN_BRIDGES {
         let smn = match Smn::open(*idx_reg, *data_reg) {
