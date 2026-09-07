@@ -92,10 +92,7 @@ fn parse_val(s: &str) -> Result<(i64, bool)> {
 }
 
 pub fn list() {
-    println!(
-        "{:<22} {:>6} {:>8}  {}",
-        "名称(别名)", "msg", "单位", "说明"
-    );
+    println!("{:<22} {:>6} {:>8}  说明", "名称(别名)", "msg", "单位");
     for c in CMDS {
         println!(
             "{:<22} 0x{:04X} {:>8}  {}",
@@ -129,7 +126,11 @@ pub fn set_coper(core: u32, value: i64) -> Result<()> {
             println!("✅ coper 核{core} ← {value} (编码 0x{enc:08X}) — SMU 响应 OK (只写, 无读回)");
             Ok(())
         }
-        r => bail!("SMU 响应: {}", match r { 0xFF => "Failed", 0xFE => "UnknownCmd", 0xFD => "RejectedPrereq", 0xFC => "Busy", x => return anyhow::bail!("0x{x:X}"), }),
+        0xFF => bail!("SMU 响应: Failed"),
+        0xFE => bail!("SMU 响应: UnknownCmd"),
+        0xFD => bail!("SMU 响应: RejectedPrereq"),
+        0xFC => bail!("SMU 响应: Busy"),
+        r => bail!("SMU 响应: 0x{r:X}"),
     }
 }
 

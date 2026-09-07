@@ -61,6 +61,15 @@ fn reading_color(r: &Unit, v: f64) -> Color {
     match r {
         Unit::TempC => temp_color(v),
         Unit::Watts if v >= 25.0 => Color::Yellow,
+        Unit::Dbm => {
+            if v > -60.0 {
+                Color::Green
+            } else if v > -75.0 {
+                Color::Yellow
+            } else {
+                Color::Red
+            }
+        }
         _ => Color::Reset,
     }
 }
@@ -324,37 +333,86 @@ fn draw_sensors(f: &mut Frame, area: Rect, s: &Snapshot) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     let ncols = if s.chips.len() > 12 { 4 } else { 3 };
+
+    // 每芯片先渲染成行 (smu 类芯片的每核 clk/W/VID 三读数压缩为一行),
+    // 再按高度降序贪心装柱 (first-fit decreasing) — 轮转分配会让大芯片
+    // (smu 40+ 读数) 整片被裁掉, 顺序分配则柱子高矮悬殊
+    let mut views: Vec<Vec<Line>> = s.chips.iter().map(chip_lines).collect();
+    views.sort_by_key(|v| usize::MAX - v.len()); // 稳定降序
+    let mut cols: Vec<Vec<Line>> = (0..ncols).map(|_| Vec::new()).collect();
+    let mut heights = vec![0usize; ncols];
+    for lines in views {
+        let c = heights
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, h)| *h)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        heights[c] += lines.len();
+        cols[c].extend(lines);
+    }
+
     let constraints: Vec<Constraint> = (0..ncols)
         .map(|_| Constraint::Ratio(1, ncols as u32))
         .collect();
-    let cols = Layout::horizontal(constraints).split(inner);
-    for (i, col) in cols.iter().enumerate() {
-        let mut lines: Vec<Line> = Vec::new();
-        for chip in s.chips.iter().skip(i).step_by(ncols) {
-            lines.push(Line::from(Span::styled(
-                chip.name.clone(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            for r in &chip.readings {
-                let color = reading_color(&r.unit, r.value);
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!(" {:<15}", r.label),
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                    Span::styled(r.unit.fmt_value(r.value), Style::default().fg(color)),
-                    Span::styled(
-                        format!("{} ", r.unit.suffix()),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]));
-            }
-            lines.push(Line::from(""));
-        }
-        f.render_widget(Paragraph::new(lines), *col);
+    let rects = Layout::horizontal(constraints).split(inner);
+    for (i, lines) in cols.into_iter().enumerate() {
+        f.render_widget(Paragraph::new(lines), rects[i]);
     }
+}
+
+/// 识别 C<数字>_<kind> 形式的每核读数 (smu / smu-cores 芯片)
+fn core_triplet(label: &str) -> Option<(&str, &str)> {
+    let (c, kind) = label.split_once('_')?;
+    if c.len() >= 2 && c.starts_with('C') && c[1..].chars().all(|x| x.is_ascii_digit()) {
+        Some((c, kind))
+    } else {
+        None
+    }
+}
+
+fn chip_lines(chip: &crate::model::Chip) -> Vec<Line<'static>> {
+    use std::collections::BTreeMap;
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        format!("▸ {}", chip.name),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    // 每核读数按核聚合: C00_clk/C00_w/C00_vid → 一行 "C00 1505MHz 0.99W 0.95V"
+    let mut cores: BTreeMap<String, Vec<Span<'static>>> = BTreeMap::new();
+    for r in &chip.readings {
+        // 零值 (时钟门控/风扇停转) 压暗, 让活跃读数更醒目
+        let color = if r.value == 0.0 {
+            Color::DarkGray
+        } else {
+            reading_color(&r.unit, r.value)
+        };
+        let text = format!("{}{}", r.unit.fmt_value(r.value), r.unit.suffix());
+        if let Some((c, _)) = core_triplet(&r.label) {
+            cores.entry(c.to_string())
+                .or_default()
+                .push(Span::styled(format!(" {text:>9}"), Style::default().fg(color)));
+            continue;
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:<13}", r.label),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::styled(format!("{text:>10} "), Style::default().fg(color)),
+        ]));
+    }
+    for (c, spans) in cores {
+        let mut l = vec![Span::styled(
+            format!(" {c:<6}"),
+            Style::default().add_modifier(Modifier::DIM),
+        )];
+        l.extend(spans);
+        lines.push(Line::from(l));
+    }
+    lines.push(Line::from(""));
+    lines
 }
 
 fn draw_charts(f: &mut Frame, area: Rect, hist: &History) {

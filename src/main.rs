@@ -1,3 +1,6 @@
+// SMN 地址常量按语义分组 (如 0x3B10_A20), 不强制等长四位分组
+#![allow(clippy::unusual_byte_groupings)]
+
 mod logger;
 mod model;
 mod probe;
@@ -56,6 +59,8 @@ fn run(args: &[String]) -> Result<()> {
         "smu-probe" => smu::probe(),
         "smu-table" => smu::smu_table(),
         "smuctl" => smuctl::run(&positional[1..]),
+        // 开发用: 渲染一帧到 TestBackend 打印纯文本, 不进帮助
+        "render-test" => render_test(),
         other => {
             eprintln!("未知子命令: {other}");
             print_help();
@@ -259,4 +264,23 @@ fn run_log(path: Option<String>, interval: f64) -> Result<()> {
         logger.write(&s)?;
         std::thread::sleep(Duration::from_secs_f64(interval));
     }
+}
+
+/// 开发用: 渲染一帧 TUI 到 TestBackend 并打印纯文本 (无颜色), 用于布局检查
+fn render_test() -> Result<()> {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut prober = Prober::new();
+    let _ = prober.snapshot()?;
+    std::thread::sleep(Duration::from_millis(600));
+    let s = prober.snapshot()?;
+    let mut hist = ui::History::new(150);
+    for _ in 0..40 {
+        hist.push(&s);
+    }
+    let mut terminal = Terminal::new(TestBackend::new(160, 50))?;
+    terminal.draw(|f| ui::draw(f, &s, &hist, false, 1.0, None))?;
+    println!("{}", terminal.backend());
+    Ok(())
 }

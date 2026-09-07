@@ -210,11 +210,7 @@ impl Prober {
                 readings: rapl,
             });
         }
-        let drm_sensors = self
-            .drm
-            .as_ref()
-            .map(|f| read_drm_sensors(f))
-            .unwrap_or_default();
+        let drm_sensors = self.drm.as_ref().map(read_drm_sensors).unwrap_or_default();
         if !drm_sensors.is_empty() {
             chips.push(Chip {
                 name: "amdgpu-sensor".into(),
@@ -404,7 +400,10 @@ fn rapl_zones(prev: &mut HashMap<String, (u64, Instant, u64)>) -> Vec<Reading> {
     out
 }
 
-fn read_stat() -> Option<(u64, u64, Vec<(u64, u64)>)> {
+/// (聚合 idle, 聚合 total, 每线程 (idle, total))
+type StatSnapshot = (u64, u64, Vec<(u64, u64)>);
+
+fn read_stat() -> Option<StatSnapshot> {
     let s = fs::read_to_string("/proc/stat").ok()?;
     let mut agg = None;
     let mut per = Vec::new();
@@ -643,7 +642,7 @@ fn read_uptime_load() -> (f64, [f32; 3]) {
         .and_then(|s| s.split_whitespace().next()?.parse().ok())
         .unwrap_or(0.0);
     let mut load = [0.0f32; 3];
-    if let Some(l) = fs::read_to_string("/proc/loadavg").ok() {
+    if let Ok(l) = fs::read_to_string("/proc/loadavg") {
         for (i, v) in l.split_whitespace().take(3).enumerate() {
             load[i] = v.parse().unwrap_or(0.0);
         }
