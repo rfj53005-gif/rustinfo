@@ -53,9 +53,8 @@ fn msr_read(cpu: usize, addr: u64) -> Option<u64> {
 }
 
 impl MsrState {
-    fn init() -> Option<MsrState> {
+    fn init(n: usize) -> Option<MsrState> {
         let base = Path::new("/sys/devices/system/cpu");
-        let n = thread_count();
         let mut groups: Vec<(String, usize)> = Vec::new();
         let mut seen: HashMap<String, ()> = HashMap::new();
         for i in 0..n {
@@ -125,10 +124,20 @@ pub struct Prober {
     prev_net: HashMap<String, (u64, u64, Instant)>,
     msr: Option<MsrState>,
     last_snap: Option<Instant>,
+    // 静态/半静态缓存: 整个运行期只解析一次, 不再每个采样周期重读
+    hostname: String,
+    kernel: String,
+    model: String,
+    threads: usize,
+    freq_paths: Vec<PathBuf>,
+    amdgpu_dev: Option<PathBuf>,
+    drm: Option<File>,
+    chip_probes: Option<Vec<ChipProbe>>,
 }
 
 impl Prober {
     pub fn new() -> Self {
+        let threads = thread_count();
         Self {
             prev_idle: None,
             prev_total: None,
@@ -138,6 +147,20 @@ impl Prober {
             prev_net: HashMap::new(),
             msr: None,
             last_snap: None,
+            hostname: read_trimmed(Path::new("/proc/sys/kernel/hostname")).unwrap_or_default(),
+            kernel: read_trimmed(Path::new("/proc/sys/kernel/osrelease")).unwrap_or_default(),
+            model: cpu_model(),
+            threads,
+            freq_paths: (0..threads)
+                .map(|i| {
+                    PathBuf::from(format!(
+                        "/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq"
+                    ))
+                })
+                .collect(),
+            amdgpu_dev: amdgpu_dev_path(),
+            drm: amdgpu_card_node().and_then(|n| File::open(n).ok()),
+            chip_probes: None,
         }
     }
 
@@ -150,14 +173,12 @@ impl Prober {
             .filter(|d| *d >= 0.05);
         self.last_snap = Some(now);
 
-        let hostname = read_trimmed(Path::new("/proc/sys/kernel/hostname")).unwrap_or_default();
-        let kernel = read_trimmed(Path::new("/proc/sys/kernel/osrelease")).unwrap_or_default();
         let (uptime_s, load) = read_uptime_load();
         let (total_pct, per_pct) = self.cpu_usage();
-        let per_mhz = read_freqs(thread_count());
+        let per_mhz = read_freqs(&self.freq_paths);
         let mut rapl = rapl_zones(&mut self.prev_rapl);
         if self.msr.is_none() {
-            self.msr = MsrState::init();
+            self.msr = MsrState::init(self.threads);
         }
         rapl.extend(self.msr.as_mut().map(|m| m.power_watts(dt)).unwrap_or_default());
         let pkg_w = rapl
@@ -165,7 +186,7 @@ impl Prober {
             .find(|r| r.label == "Package")
             .map(|r| r.value);
         let cpu = CpuSnapshot {
-            model: cpu_model(),
+            model: self.model.clone(),
             total_pct,
             per_pct,
             per_mhz,
@@ -181,22 +202,30 @@ impl Prober {
         };
         let mem = read_mem();
         let (battery, ac_online) = read_battery_and_ac();
-        let vram = read_vram();
-        let mut chips = read_chips();
+        let vram = self.amdgpu_dev.as_deref().and_then(read_vram);
+        let mut chips = self.read_chips();
         if !rapl.is_empty() {
             chips.push(Chip {
                 name: "rapl".into(),
                 readings: rapl,
             });
         }
-        let drm_sensors = read_drm_sensors();
+        let drm_sensors = self
+            .drm
+            .as_ref()
+            .map(|f| read_drm_sensors(f))
+            .unwrap_or_default();
         if !drm_sensors.is_empty() {
             chips.push(Chip {
                 name: "amdgpu-sensor".into(),
                 readings: drm_sensors,
             });
         }
-        let dpm = read_amdgpu_dpm();
+        let dpm = self
+            .amdgpu_dev
+            .as_deref()
+            .map(read_amdgpu_dpm)
+            .unwrap_or_default();
         if !dpm.is_empty() {
             chips.push(Chip {
                 name: "amdgpu-dpm".into(),
@@ -222,8 +251,8 @@ impl Prober {
         chips.extend(read_smu());
         Ok(Snapshot {
             time: Local::now(),
-            hostname,
-            kernel,
+            hostname: self.hostname.clone(),
+            kernel: self.kernel.clone(),
             uptime_s,
             load,
             cpu,
@@ -271,6 +300,36 @@ impl Prober {
         self.prev_total = Some(total);
         self.prev_per = per;
         (total_pct, per_pct)
+    }
+
+    /// hwmon 逐值读取: 目录枚举/label 在首次调用时缓存 (chip_probes),
+    /// 之后每个采样周期只读数值文件本身
+    fn read_chips(&mut self) -> Vec<Chip> {
+        let probes = self.chip_probes.get_or_insert_with(enum_hwmon);
+        probes
+            .iter()
+            .filter_map(|p| {
+                let readings: Vec<Reading> = p
+                    .items
+                    .iter()
+                    .filter_map(|i| {
+                        Some(Reading {
+                            label: i.label.clone(),
+                            value: read_num::<f64>(&i.path)? / i.scale,
+                            unit: i.unit,
+                        })
+                    })
+                    .collect();
+                if readings.is_empty() {
+                    None
+                } else {
+                    Some(Chip {
+                        name: p.name.clone(),
+                        readings,
+                    })
+                }
+            })
+            .collect()
     }
 }
 
@@ -350,7 +409,8 @@ fn read_stat() -> Option<(u64, u64, Vec<(u64, u64)>)> {
     let mut agg = None;
     let mut per = Vec::new();
     for line in s.lines() {
-        let Some(rest) = line.strip_prefix("cpu") else { continue };
+        // cpu 行在文件头部连续排列, 首个非 cpu 行 (intr) 之后的内容无需解析
+        let Some(rest) = line.strip_prefix("cpu") else { break };
         let is_agg = rest.starts_with(' ');
         if !is_agg && !rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
             continue;
@@ -379,14 +439,13 @@ fn read_stat() -> Option<(u64, u64, Vec<(u64, u64)>)> {
     agg.map(|(i, t)| (i, t, per))
 }
 
-fn read_freqs(threads: usize) -> Vec<f32> {
-    (0..threads)
-        .map(|i| {
-            read_num::<f64>(Path::new(&format!(
-                "/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq"
-            )))
-            .map(|khz| (khz / 1000.0) as f32)
-            .unwrap_or(0.0)
+fn read_freqs(paths: &[PathBuf]) -> Vec<f32> {
+    paths
+        .iter()
+        .map(|p| {
+            read_num::<f64>(p)
+                .map(|khz| (khz / 1000.0) as f32)
+                .unwrap_or(0.0)
         })
         .collect()
 }
@@ -425,12 +484,9 @@ fn amdgpu_card_node() -> Option<String> {
 
 /// amdgpu DRM 传感器: ioctl 直读 SMU 实时值 (GFX/MCLK 时钟、负载、功率)
 /// 这是 pp_dpm_mclk 之外的细粒度实时频率来源 (nvtop 同款)
-fn read_drm_sensors() -> Vec<Reading> {
-    use std::fs::File;
+fn read_drm_sensors(f: &File) -> Vec<Reading> {
     use std::os::fd::AsRawFd;
 
-    let Some(node) = amdgpu_card_node() else { return Vec::new() };
-    let Ok(f) = File::open(&node) else { return Vec::new() };
     let fd = f.as_raw_fd();
 
     let mut info = DrmAmdgpuInfo {
@@ -473,24 +529,24 @@ fn amdgpu_dev_path() -> Option<PathBuf> {
 }
 
 fn read_mem() -> MemSnapshot {
-    let map: HashMap<String, u64> = fs::read_to_string("/proc/meminfo")
-        .map(|s| {
-            s.lines()
-                .filter_map(|l| {
-                    let mut it = l.split_whitespace();
-                    let key = it.next()?.trim_end_matches(':').to_string();
-                    let val = it.next()?.parse().ok()?;
-                    Some((key, val))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    MemSnapshot {
-        total_kib: *map.get("MemTotal").unwrap_or(&0),
-        avail_kib: *map.get("MemAvailable").unwrap_or(&0),
-        swap_total_kib: *map.get("SwapTotal").unwrap_or(&0),
-        swap_free_kib: *map.get("SwapFree").unwrap_or(&0),
+    let mut m = MemSnapshot::default();
+    let Ok(s) = fs::read_to_string("/proc/meminfo") else {
+        return m;
+    };
+    let val = |line: &str| -> Option<u64> {
+        line.split_whitespace().nth(1)?.parse().ok()
+    };
+    for line in s.lines() {
+        let Some(v) = val(line) else { continue };
+        match line.split(':').next().unwrap_or("") {
+            "MemTotal" => m.total_kib = v,
+            "MemAvailable" => m.avail_kib = v,
+            "SwapTotal" => m.swap_total_kib = v,
+            "SwapFree" => m.swap_free_kib = v,
+            _ => {}
+        }
     }
+    m
 }
 
 fn read_battery_and_ac() -> (Option<BatterySnapshot>, Option<bool>) {
@@ -569,8 +625,7 @@ fn read_battery_and_ac() -> (Option<BatterySnapshot>, Option<bool>) {
     (batt, ac)
 }
 
-fn read_vram() -> Option<VramSnapshot> {
-    let dev = amdgpu_dev_path()?;
+fn read_vram(dev: &Path) -> Option<VramSnapshot> {
     let total_mib =
         read_num::<f64>(&dev.join("mem_info_vram_total")).unwrap_or(0.0) / 1048576.0;
     let used_mib = read_num::<f64>(&dev.join("mem_info_vram_used")).unwrap_or(0.0) / 1048576.0;
@@ -596,7 +651,20 @@ fn read_uptime_load() -> (f64, [f32; 3]) {
     (uptime_s, load)
 }
 
-pub fn read_chips() -> Vec<Chip> {
+/// hwmon 一次性枚举结果: 路径 + 标签 + 单位/缩放, 采样周期只需重读数值
+struct ChipProbe {
+    name: String,
+    items: Vec<ReadingProbe>,
+}
+
+struct ReadingProbe {
+    path: PathBuf,
+    label: String,
+    unit: Unit,
+    scale: f64,
+}
+
+fn enum_hwmon() -> Vec<ChipProbe> {
     let mut chips = Vec::new();
     let Ok(entries) = fs::read_dir("/sys/class/hwmon") else {
         return chips;
@@ -634,7 +702,7 @@ pub fn read_chips() -> Vec<Chip> {
         }
         nums.sort();
         nums.dedup();
-        let mut readings = Vec::new();
+        let mut items = Vec::new();
         for (kind, n) in nums {
             let (unit, scale) = match kind.as_str() {
                 "temp" => (Unit::TempC, 1000.0),
@@ -645,40 +713,33 @@ pub fn read_chips() -> Vec<Chip> {
                 "energy" => (Unit::Joules, 1_000_000.0),
                 _ => (Unit::Pct, 255.0),
             };
-            let file = if kind == "pwm" {
-                format!("pwm{n}")
+            let (file, label) = if kind == "pwm" {
+                (format!("pwm{n}"), format!("pwm{n}"))
             } else {
-                format!("{kind}{n}_input")
+                (
+                    format!("{kind}{n}_input"),
+                    read_trimmed(&dir.join(format!("{kind}{n}_label")))
+                        .unwrap_or_else(|| format!("{kind}{n}")),
+                )
             };
-            let Some(raw) = read_num::<f64>(&dir.join(&file)) else {
-                continue;
-            };
-            let label = if kind == "pwm" {
-                format!("pwm{n}")
-            } else {
-                read_trimmed(&dir.join(format!("{kind}{n}_label")))
-                    .unwrap_or_else(|| format!("{kind}{n}"))
-            };
-            readings.push(Reading {
+            items.push(ReadingProbe {
+                path: dir.join(file),
                 label,
-                value: raw / scale,
                 unit,
+                scale,
             });
         }
-        if readings.is_empty() {
+        if items.is_empty() {
             continue;
         }
-        readings.sort_by(|a, b| a.label.cmp(&b.label));
-        chips.push(Chip { name, readings });
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        chips.push(ChipProbe { name, items });
     }
     chips
 }
 
 /// amdgpu DPM 状态与占用率 (pp_dpm_* 中带 * 的是当前档位; 时钟门控时无标记, 报最高档 _max)
-fn read_amdgpu_dpm() -> Vec<Reading> {
-    let Some(dev) = amdgpu_dev_path() else {
-        return Vec::new();
-    };
+fn read_amdgpu_dpm(dev: &Path) -> Vec<Reading> {
     let mut out = Vec::new();
     for (file, label) in [("gpu_busy_percent", "busy"), ("vcn_busy_percent", "vcn_busy")] {
         if let Some(v) = read_num::<f64>(&dev.join(file)) {

@@ -81,7 +81,7 @@ fn print_help() {
     println!("  log [文件]    无界面 CSV 记录, Ctrl-C 结束 (默认 rustinfo_时间戳.csv)");
     println!("  smu-probe     SMU 邮箱通道探测");
     println!("  smu-table     抓取 SMU pm_table 遥测");
-    println!("  smuctl        SMU 直控 (替代 ryzenadj): smuctl list | smuctl <名称> <值>");
+    println!("  smuctl        SMU 直控 (替代 ryzenadj, 仅 family 0x1A): smuctl list | smuctl <名称> <值>");
     println!();
     println!("按键 (tui): q 退出 │ 空格 暂停 │ l CSV记录 │ +/- 调整采样间隔");
 }
@@ -101,11 +101,19 @@ fn tui_loop(terminal: &mut DefaultTerminal, prober: &mut Prober, mut interval: f
     let mut logger: Option<logger::Logger> = None;
     let mut paused = false;
     let mut last_tick = Instant::now();
+    let mut dirty = true;
 
     loop {
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
+        // 距下次采样的剩余时间作为 poll 超时; 暂停时纯等按键, 不再定时刷新
+        let timeout = if paused {
+            Duration::from_secs(3600)
+        } else {
+            let remain = interval - last_tick.elapsed().as_secs_f64();
+            Duration::from_secs_f64(remain.clamp(0.02, interval))
+        };
+        if event::poll(timeout)? {
+            match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
                     match k.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char(' ') => paused = !paused,
@@ -122,7 +130,10 @@ fn tui_loop(terminal: &mut DefaultTerminal, prober: &mut Prober, mut interval: f
                         KeyCode::Char('-') | KeyCode::Char('_') => interval = (interval / 1.5).max(0.2),
                         _ => {}
                     }
+                    dirty = true;
                 }
+                Event::Resize(..) => dirty = true,
+                _ => {}
             }
         }
 
@@ -133,11 +144,16 @@ fn tui_loop(terminal: &mut DefaultTerminal, prober: &mut Prober, mut interval: f
                 l.write(&snapshot)?;
             }
             last_tick = Instant::now();
+            dirty = true;
         }
 
-        terminal.draw(|f| {
-            ui::draw(f, &snapshot, &hist, paused, interval, logger.as_ref().map(|l| l.path()))
-        })?;
+        // 只有数据/按键/窗口尺寸变化才重绘, 避免空转
+        if dirty {
+            terminal.draw(|f| {
+                ui::draw(f, &snapshot, &hist, paused, interval, logger.as_ref().map(|l| l.path()))
+            })?;
+            dirty = false;
+        }
     }
 
     if let Some(mut l) = logger {
