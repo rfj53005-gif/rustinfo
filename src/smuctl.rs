@@ -57,13 +57,18 @@ pub fn run(args: &[String]) -> Result<()> {
             list();
             Ok(())
         }
-        Some("coper") if args.len() >= 3 => {
-            let core: u32 = args[1]
+        Some("coper") => {
+            // coper 必须是 <核号> <值> 两参数 — 少参数时若落入通用 set() 会把
+            // 单个值当成未编码 arg 发给 0x4B, 语义错误
+            let (Some(c), Some(v)) = (args.get(1), args.get(2)) else {
+                bail!("用法: rustinfo smuctl coper <核号 0-13> <值>");
+            };
+            let core: u32 = c
                 .parse()
-                .with_context(|| format!("核心号 \"{}\" 无效 (0-13, 硬件核号)", args[1]))?;
-            let val: i64 = args[2]
+                .with_context(|| format!("核心号 \"{c}\" 无效 (0-13, 硬件核号)"))?;
+            let val: i64 = v
                 .parse()
-                .with_context(|| format!("值 \"{}\" 不是整数", args[2]))?;
+                .with_context(|| format!("值 \"{v}\" 不是整数"))?;
             set_coper(core, val)
         }
         Some(name) => {
@@ -142,6 +147,9 @@ pub fn set(name: &str, value: i64, hex: bool) -> Result<()> {
             CMDS.len()
         );
     };
+    if c.id == 0x4B {
+        bail!("coper 需要两个参数: rustinfo smuctl coper <核号 0-13> <值>");
+    }
     let raw: u32 = if c.id == 0x4C || c.id == 0x4B {
         if hex {
             value as u32 // 0x 前缀 = 原始 arg 直通 (如 0x0FFFFFE5 ≡ co -27)

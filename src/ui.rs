@@ -136,16 +136,20 @@ fn find_tctl(s: &Snapshot) -> Option<f64> {
 // ---------- 顶层绘制 ----------
 
 pub fn draw(f: &mut Frame, s: &Snapshot, hist: &History, paused: bool, interval: f64, log_path: Option<&str>) {
+    // CPU 面板高度随线程数自适应 (每列至多 12 线程, 至多 3 列), 避免高线程数机器被裁剪
+    let n = s.cpu.per_mhz.len();
+    let cpu_cols = n.div_ceil(12).clamp(1, 3);
+    let cpu_rows = (n.div_ceil(cpu_cols) + 2).max(4) as u16;
     let rows = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(13),
+        Constraint::Length(cpu_rows),
         Constraint::Min(4),
         Constraint::Length(5),
         Constraint::Length(1),
     ])
     .split(f.area());
     draw_header(f, rows[0], s);
-    draw_top(f, rows[1], s);
+    draw_top(f, rows[1], s, cpu_cols);
     draw_sensors(f, rows[2], s);
     draw_charts(f, rows[3], hist);
     draw_footer(f, rows[4], paused, interval, log_path);
@@ -176,17 +180,17 @@ fn draw_header(f: &mut Frame, area: Rect, s: &Snapshot) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_top(f: &mut Frame, area: Rect, s: &Snapshot) {
+fn draw_top(f: &mut Frame, area: Rect, s: &Snapshot, cpu_cols: usize) {
     let cols = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(area);
 
     let cpu_block = panel(format!("CPU · {}", truncate(&s.cpu.model, 48)));
     let cpu_inner = cpu_block.inner(cols[0]);
     f.render_widget(cpu_block, cols[0]);
-    let tc = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(cpu_inner);
-    let half = s.cpu.per_mhz.len().div_ceil(2);
+    let tc = Layout::horizontal(vec![Constraint::Ratio(1, cpu_cols as u32); cpu_cols]).split(cpu_inner);
+    let per_col = s.cpu.per_mhz.len().div_ceil(cpu_cols);
     for (i, col) in tc.iter().enumerate() {
         let mut lines = Vec::new();
-        for t in (i * half)..((i + 1) * half).min(s.cpu.per_mhz.len()) {
+        for t in (i * per_col)..((i + 1) * per_col).min(s.cpu.per_mhz.len()) {
             let pct = s.cpu.per_pct.get(t).copied().unwrap_or(0.0);
             let mhz = s.cpu.per_mhz[t];
             let color = usage_color(pct as f64);
@@ -379,8 +383,31 @@ fn chip_lines(chip: &crate::model::Chip) -> Vec<Line<'static>> {
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     ))];
-    // 每核读数按核聚合: C00_clk/C00_w/C00_vid → 一行 "C00 1505MHz 0.99W 0.95V"
-    let mut cores: BTreeMap<String, Vec<Span<'static>>> = BTreeMap::new();
+    // 每核读数按核聚合为一行。先收集本芯片实际出现的 kind (首选序 clk→temp→w→vid)
+    // 再致密分列 — 固定四槽会给 smu (无 temp) 留永久空洞; 缺项核 (如 clk=0 被过滤) 留空不前移
+    fn col_of(kind: &str) -> Option<usize> {
+        match kind.to_ascii_lowercase().as_str() {
+            "clk" | "clock" => Some(0),
+            "temp" => Some(1),
+            "w" => Some(2),
+            "vid" => Some(3),
+            _ => None,
+        }
+    }
+    let mut kinds: Vec<usize> = Vec::new();
+    for r in &chip.readings {
+        if let Some((_, k)) = core_triplet(&r.label) {
+            if let Some(i) = col_of(k) {
+                if !kinds.contains(&i) {
+                    kinds.push(i);
+                }
+            }
+        }
+    }
+    kinds.sort_unstable();
+    let nslots = kinds.len();
+    let mut cores: BTreeMap<String, Vec<Option<Span<'static>>>> = BTreeMap::new();
+    let mut misc_cores: BTreeMap<String, Vec<Span<'static>>> = BTreeMap::new();
     for r in &chip.readings {
         // 零值 (时钟门控/风扇停转) 压暗, 让活跃读数更醒目
         let color = if r.value == 0.0 {
@@ -389,10 +416,15 @@ fn chip_lines(chip: &crate::model::Chip) -> Vec<Line<'static>> {
             reading_color(&r.unit, r.value)
         };
         let text = format!("{}{}", r.unit.fmt_value(r.value), r.unit.suffix());
-        if let Some((c, _)) = core_triplet(&r.label) {
-            cores.entry(c.to_string())
-                .or_default()
-                .push(Span::styled(format!(" {text:>9}"), Style::default().fg(color)));
+        if let Some((c, kind)) = core_triplet(&r.label) {
+            let span = Span::styled(format!("{text:>10}"), Style::default().fg(color));
+            match col_of(kind).and_then(|i| kinds.iter().position(|&k| k == i)) {
+                Some(dense) => {
+                    cores.entry(c.to_string()).or_insert_with(|| vec![None; nslots])[dense] =
+                        Some(span)
+                }
+                None => misc_cores.entry(c.to_string()).or_default().push(span),
+            }
             continue;
         }
         lines.push(Line::from(vec![
@@ -403,9 +435,19 @@ fn chip_lines(chip: &crate::model::Chip) -> Vec<Line<'static>> {
             Span::styled(format!("{text:>10} "), Style::default().fg(color)),
         ]));
     }
-    for (c, spans) in cores {
+    for (c, slots) in cores {
         let mut l = vec![Span::styled(
-            format!(" {c:<6}"),
+            format!(" {c:<5}"),
+            Style::default().add_modifier(Modifier::DIM),
+        )];
+        for slot in slots {
+            l.push(slot.unwrap_or_else(|| Span::raw(" ".repeat(10))));
+        }
+        lines.push(Line::from(l));
+    }
+    for (c, spans) in misc_cores {
+        let mut l = vec![Span::styled(
+            format!(" {c:<5}"),
             Style::default().add_modifier(Modifier::DIM),
         )];
         l.extend(spans);

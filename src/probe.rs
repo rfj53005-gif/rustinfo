@@ -58,15 +58,23 @@ impl MsrState {
         let mut groups: Vec<(String, usize)> = Vec::new();
         let mut seen: HashMap<String, ()> = HashMap::new();
         for i in 0..n {
-            let core_id = read_trimmed(&base.join(format!("cpu{i}/topology/core_id")))?;
-            let sibs = read_trimmed(&base.join(format!("cpu{i}/topology/thread_siblings_list")))?;
+            // 离线/热插拔 CPU 可能读不到 topology, 跳过该核而不是整体放弃
+            let (Some(core_id), Some(sibs)) = (
+                read_trimmed(&base.join(format!("cpu{i}/topology/core_id"))),
+                read_trimmed(&base.join(format!("cpu{i}/topology/thread_siblings_list"))),
+            ) else {
+                continue;
+            };
             if seen.insert(sibs, ()).is_some() {
                 continue; // SMT 兄弟, 同一物理核
             }
             groups.push((format!("C{core_id:0>2}"), i));
         }
-        let esu = ((msr_read(groups.first()?.1, MSR_RAPL_POWER_UNIT)? >> 8) & 0x1F) as i32;
-        let j_per_lsb = 2f64.powi(-esu);
+        // Esu 从第一个可读 MSR 的核取 (首个核可能离线)
+        let esu_raw = groups
+            .iter()
+            .find_map(|&(_, cpu)| msr_read(cpu, MSR_RAPL_POWER_UNIT))?;
+        let j_per_lsb = 2f64.powi(-(((esu_raw >> 8) & 0x1F) as i32));
         let cores = groups
             .into_iter()
             .filter_map(|(label, cpu)| {
@@ -124,6 +132,8 @@ pub struct Prober {
     prev_net: HashMap<String, (u64, u64, Instant)>,
     msr: Option<MsrState>,
     last_snap: Option<Instant>,
+    // 最近一次有效占用率: 采样窗口过小 (<50ms) 时回用, 避免瞬时噪声 (如 CSV 首行 100%)
+    pct_cache: (f32, Vec<f32>),
     // 静态/半静态缓存: 整个运行期只解析一次, 不再每个采样周期重读
     hostname: String,
     kernel: String,
@@ -147,6 +157,7 @@ impl Prober {
             prev_net: HashMap::new(),
             msr: None,
             last_snap: None,
+            pct_cache: (0.0, Vec::new()),
             hostname: read_trimmed(Path::new("/proc/sys/kernel/hostname")).unwrap_or_default(),
             kernel: read_trimmed(Path::new("/proc/sys/kernel/osrelease")).unwrap_or_default(),
             model: cpu_model(),
@@ -174,7 +185,7 @@ impl Prober {
         self.last_snap = Some(now);
 
         let (uptime_s, load) = read_uptime_load();
-        let (total_pct, per_pct) = self.cpu_usage();
+        let (total_pct, per_pct) = self.cpu_usage(dt.is_some());
         let per_mhz = read_freqs(&self.freq_paths);
         let mut rapl = rapl_zones(&mut self.prev_rapl);
         if self.msr.is_none() {
@@ -260,42 +271,51 @@ impl Prober {
         })
     }
 
-    fn cpu_usage(&mut self) -> (f32, Vec<f32>) {
+    /// fresh=false (采样窗口 <50ms) 时不重算, 回用上次有效值 — 计数器仍照常更新
+    fn cpu_usage(&mut self, fresh: bool) -> (f32, Vec<f32>) {
         let Some((idle, total, per)) = read_stat() else {
-            return (0.0, Vec::new());
+            return self.pct_cache.clone();
         };
-        let total_pct = match (self.prev_idle, self.prev_total) {
-            (Some(pi), Some(pt)) => {
-                let dt = total.saturating_sub(pt) as f32;
-                let di = idle.saturating_sub(pi) as f32;
-                if dt > 0.0 {
-                    ((1.0 - di / dt) * 100.0).clamp(0.0, 100.0)
-                } else {
-                    0.0
-                }
-            }
-            _ => 0.0,
-        };
-        let mut per_pct = Vec::with_capacity(per.len());
-        for (i, (ci, ct)) in per.iter().enumerate() {
-            let p = match self.prev_per.get(i) {
-                Some((pi, pt)) => {
-                    let dt = ct.saturating_sub(*pt) as f32;
-                    let di = ci.saturating_sub(*pi) as f32;
+        let out = if fresh {
+            let total_pct = match (self.prev_idle, self.prev_total) {
+                (Some(pi), Some(pt)) => {
+                    let dt = total.saturating_sub(pt) as f32;
+                    let di = idle.saturating_sub(pi) as f32;
                     if dt > 0.0 {
                         ((1.0 - di / dt) * 100.0).clamp(0.0, 100.0)
                     } else {
                         0.0
                     }
                 }
-                None => 0.0,
+                _ => 0.0,
             };
-            per_pct.push(p);
-        }
+            let mut per_pct = Vec::with_capacity(per.len());
+            for (i, (ci, ct)) in per.iter().enumerate() {
+                let p = match self.prev_per.get(i) {
+                    Some((pi, pt)) => {
+                        let dt = ct.saturating_sub(*pt) as f32;
+                        let di = ci.saturating_sub(*pi) as f32;
+                        if dt > 0.0 {
+                            ((1.0 - di / dt) * 100.0).clamp(0.0, 100.0)
+                        } else {
+                            0.0
+                        }
+                    }
+                    None => 0.0,
+                };
+                per_pct.push(p);
+            }
+            (total_pct, per_pct)
+        } else {
+            self.pct_cache.clone()
+        };
         self.prev_idle = Some(idle);
         self.prev_total = Some(total);
         self.prev_per = per;
-        (total_pct, per_pct)
+        if fresh {
+            self.pct_cache = out.clone();
+        }
+        out
     }
 
     /// hwmon 逐值读取: 目录枚举/label 在首次调用时缓存 (chip_probes),
@@ -551,6 +571,7 @@ fn read_mem() -> MemSnapshot {
 fn read_battery_and_ac() -> (Option<BatterySnapshot>, Option<bool>) {
     let mut batt = None;
     let mut ac = None;
+    let mut ac_usb = None;
     let Ok(entries) = fs::read_dir("/sys/class/power_supply") else {
         return (None, None);
     };
@@ -615,13 +636,17 @@ fn read_battery_and_ac() -> (Option<BatterySnapshot>, Option<bool>) {
                     runtime_min,
                 });
             }
-            "Mains" | "USB" | "ADP" | "UPS" if ac.is_none() => {
+            // 市电类优先; USB-C PD 口插外设也会 online=1, 只作兜底
+            "Mains" | "ADP" | "UPS" if ac.is_none() => {
                 ac = read_num::<u32>(&dir.join("online")).map(|v| v == 1);
+            }
+            "USB" if ac_usb.is_none() => {
+                ac_usb = read_num::<u32>(&dir.join("online")).map(|v| v == 1);
             }
             _ => {}
         }
     }
-    (batt, ac)
+    (batt, ac.or(ac_usb))
 }
 
 fn read_vram(dev: &Path) -> Option<VramSnapshot> {
@@ -817,8 +842,11 @@ fn read_disk_io(prev: &mut HashMap<String, (u64, u64, u64, Instant)>) -> Vec<Chi
             continue;
         }
         let dev = f[2];
-        // 整盘 nvmeXnY, 排除分区 nvmeXnYpZ
-        if !(dev.starts_with("nvme") && !dev.contains('p')) {
+        // 只取整盘: nvmeXnY (排除分区 nvmeXnYpZ) / sdX (排除 sdXN) / mmcblkN (排除 mmcblkNpM)
+        let is_whole = (dev.starts_with("nvme") && !dev.contains('p'))
+            || (dev.starts_with("sd") && !dev.as_bytes()[2..].iter().any(|b| b.is_ascii_digit()))
+            || (dev.starts_with("mmcblk") && !dev.contains('p'));
+        if !is_whole {
             continue;
         }
         let Ok(sec_r) = f[5].parse::<u64>() else { continue };
@@ -884,6 +912,11 @@ fn read_net_io(prev: &mut HashMap<String, (u64, u64, Instant)>) -> Vec<Chip> {
         if name == "lo" {
             continue;
         }
+        // 只统计物理网卡 (有 device 链接); 跳过 TUN/桥/veth 等虚拟接口,
+        // 避免与物理网卡重复计流量
+        if !dir.join("device").exists() {
+            continue;
+        }
         seen.push(name.clone());
         let rx = read_num::<u64>(&dir.join("statistics/rx_bytes")).unwrap_or(0);
         let tx = read_num::<u64>(&dir.join("statistics/tx_bytes")).unwrap_or(0);
@@ -916,7 +949,7 @@ fn read_net_io(prev: &mut HashMap<String, (u64, u64, Instant)>) -> Vec<Chip> {
             });
         }
     }
-    // /proc/net/wireless: "wlp98s0: 0000 59. -51. -256 ..."
+    // /proc/net/wireless: "wlp98s0: 0000 59. -51. -256 ..." (字段带小数点尾缀)
     if let Ok(s) = fs::read_to_string("/proc/net/wireless") {
         for line in s.lines().skip(2) {
             let Some((name_raw, rest)) = line.split_once(':') else { continue };
@@ -925,7 +958,10 @@ fn read_net_io(prev: &mut HashMap<String, (u64, u64, Instant)>) -> Vec<Chip> {
                 continue;
             }
             let f: Vec<&str> = rest.split_whitespace().collect();
-            if let Some(dbm) = f.get(2).and_then(|v| v.parse::<f64>().ok()) {
+            if let Some(dbm) = f
+                .get(2)
+                .and_then(|v| v.trim_end_matches('.').parse::<f64>().ok())
+            {
                 readings.push(Reading {
                     label: format!("{name} rssi"),
                     value: dbm,
