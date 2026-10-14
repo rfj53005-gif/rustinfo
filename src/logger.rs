@@ -3,10 +3,7 @@ use crate::model::{Snapshot, Unit};
 use anyhow::{Context, Result};
 use chrono::Local;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{self, Write};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum ColumnKey {
@@ -63,7 +60,7 @@ impl Schema {
 }
 
 pub struct Logger {
-    file: BufWriter<File>,
+    file: crate::csv_writer::Output,
     schema: Schema,
     path: String,
 }
@@ -73,19 +70,8 @@ impl Logger {
         let path = path
             .map(str::to_owned)
             .unwrap_or_else(|| format!("rustinfo_{}.csv", Local::now().format("%Y%m%d_%H%M%S_%f")));
-        let mut options = OpenOptions::new();
-        options.write(true).custom_flags(libc::O_NOFOLLOW);
-        if generated {
-            options.create_new(true);
-        } else {
-            options.create(true).truncate(true);
-        }
-        let file = options
-            .open(&path)
-            .with_context(|| format!("无法创建 {path}"))?;
-        return_ownership(&file)?;
         let schema = Schema::new(snapshot);
-        let mut file = BufWriter::new(file);
+        let mut file = crate::csv_writer::Output::open(&path, generated)?;
         write_record(
             &mut file,
             schema.columns.iter().map(|column| column.name.as_str()),
@@ -101,30 +87,11 @@ impl Logger {
         Ok(())
     }
     pub fn finish(&mut self) -> Result<()> {
-        self.file.flush().context("刷新 CSV 失败")
+        self.file.finish().context("刷新 CSV 失败")
     }
     pub fn path(&self) -> &str {
         &self.path
     }
-}
-
-fn return_ownership(file: &File) -> Result<()> {
-    // SAFETY: geteuid takes no arguments and does not access Rust-managed memory.
-    if unsafe { libc::geteuid() } != 0 {
-        return Ok(());
-    }
-    let parse = |name| {
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-    };
-    if let (Some(uid), Some(gid)) = (parse("SUDO_UID"), parse("SUDO_GID")) {
-        // SAFETY: the descriptor belongs to this open file; IDs are plain numeric values.
-        if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0 {
-            return Err(io::Error::last_os_error()).context("归还 CSV 文件属主失败");
-        }
-    }
-    Ok(())
 }
 
 fn write_record<'a>(

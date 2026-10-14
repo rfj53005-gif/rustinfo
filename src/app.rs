@@ -123,6 +123,9 @@ pub fn run_log(path: Option<String>, interval: f64) -> Result<()> {
         return Ok(());
     }
     let s = prober.snapshot();
+    if shutdown.requested() {
+        return Ok(());
+    }
     let mut logger = logger::Logger::create(&s, path.as_deref())?;
     logger.write(&s)?;
     println!("记录到 {}  (Ctrl-C 结束)", logger.path());

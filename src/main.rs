@@ -2,6 +2,7 @@
 
 mod app;
 mod cli;
+mod csv_writer;
 mod logger;
 mod model;
 mod platform;
@@ -30,6 +31,9 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &[String]) -> Result<()> {
+    if args.first().is_some_and(|arg| arg == csv_writer::HELPER) {
+        return csv_writer::serve(&args[1..]);
+    }
     let options = Options::parse(args)?;
     match options.command {
         Command::Tui => app::run_tui(options.interval.as_secs_f64()),

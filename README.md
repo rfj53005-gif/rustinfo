@@ -92,7 +92,7 @@ sudo rustinfo log soak.csv -i 2
 | 温度/风扇/电压/电流/GPU DPM/磁盘/网络/PSI/电池 | ✅ | ✅ |
 | **RAPL Package 功率**、**每物理核功率** | ❌(不显示) | ✅ |
 
-原因:内核把 RAPL `energy_uj` 和 `/dev/cpu/*/msr` 限制为 root(防能耗侧信道攻击)。跑 `install.sh` 后包装器会自动免密提权,其余一切照旧;CSV 由 root 生成时会自动把属主还给你。
+原因:内核把 RAPL `energy_uj` 和 `/dev/cpu/*/msr` 限制为 root(防能耗侧信道攻击)。跑 `install.sh` 后包装器会自动免密提权,其余一切照旧;通过 sudo 运行时,CSV 由发起 sudo 的普通用户子进程创建和写入;主进程继续读取 root 传感器,记录不能借此创建、覆盖或改变 root 保护文件的属主。请选择普通用户有写入权限的目录。
 
 ## 可选:SMU 遥测模块(AMD,实验性)
 
@@ -225,5 +225,5 @@ sysfs `intel-rapl:0:0` 名叫 "core",实测证明它**不是全部核心的合�
 
 它执行格式检查、全部 target 的 Clippy 严格检查与测试。单元测试使用临时 procfs/sysfs
 文件和模拟邮箱;CLI 集成测试检查错误退出码、非终端启动和 CSV 的 Ctrl-C 收尾。
-后者会读取本机常规只读监控接口,测试不会执行有效 SMU 写参数命令。内核模块另用
+后者会读取本机常规只读监控接口,测试不会执行有效 SMU 写参数命令。以 root 运行测试时,还会验证 sudo 场景的 CSV 路径权限、文件属主和子进程收尾。内核模块另用
 `make -C module LLVM=1` 验证(CachyOS/Clang 内核);模块编译不等于已加载或完成硬件写入测试。

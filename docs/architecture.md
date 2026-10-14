@@ -51,12 +51,23 @@ Optional package-power, battery, and VRAM fields have columns from the beginning
 Unavailable readings are blank. Newly discovered devices require a new recording
 because a CSV has a fixed rectangular schema.
 
-CSV writes use a buffered writer and flush each record. Generated names are
+CSV writes use buffered output and flush each record. Generated names are
 created exclusively. Explicit filenames retain overwrite behaviour, but symbolic
-links are refused. When run through sudo, ownership is returned through the open
-file descriptor using numeric SUDO_UID/SUDO_GID, avoiding a path-based ownership
-race or external `id` commands. SIGINT/SIGTERM interrupts sampling waits so the
-logger can finish and unregister its signal handlers.
+links and non-regular files are refused. Root sampling through sudo uses an
+unprivileged child writer, running with numeric SUDO_UID/SUDO_GID and no inherited
+supplementary groups. It receives length-framed records over stdin and acknowledges
+only after writing and flushing each record. The sampling process does not create,
+truncate, or chown the destination. A root invocation cannot bypass this through
+the private helper mode: that mode refuses to run as root. This closes the old
+passwordless-wrapper path to privileged file creation/ownership changes. Direct
+root sessions without SUDO_UID retain explicit administrator file access.
+
+The child ignores foreground cancellation signals, finishes on pipe EOF, and is
+reaped by its owner; the parent handles SIGINT/SIGTERM and closes its stream after
+flushing. Caller-owned directories work as before. Shared directories requiring
+supplementary-group membership may require selecting a destination accessible to
+the caller's primary group. The helper executable must be traversable/executable
+by the caller (as it is in /usr/bin, /usr/local/bin, and their own cargo directory).
 
 The terminal draws immediately, chooses readable column widths, omits per-thread
 frequency text when the column is too narrow, and scrolls the sensor list with
@@ -103,6 +114,6 @@ Unit tests use fixture files and an in-memory mailbox to cover sampling, parsing
 reset/wrap behaviour, duplicate devices, response rejection/timeouts, and tiny
 terminal sizes. CLI integration tests invoke the binary, including a child CSV
 logger that receives SIGINT; monitoring reads are permitted, control writes are
-never issued. Kernel compilation and real read-only dump/render smoke checks are
+never issued. Root-only CLI tests also check that a sudo caller cannot create/overwrite root-protected paths, that the private helper cannot run as root, and that output belongs to the caller. Kernel compilation and real read-only dump/render smoke checks are
 separate from these tests. Hardware voltage changes and module loading still need
 explicit real-machine validation before deployment.
