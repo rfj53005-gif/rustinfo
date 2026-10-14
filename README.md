@@ -13,6 +13,22 @@ HWiNFO 风格的 Linux 硬件监控,纯 Rust 实现。实时 TUI 面板 + 一次
 
 ## 安装
 
+### Arch Linux / CachyOS:AUR 打包
+
+已提供 [AUR 打包文件与发布说明](packaging/aur/README.md)。**目前是待发布配方,尚未上架 AUR**。
+上架后完整安装只需一条命令(一起安装当前内核对应的 headers):
+
+```bash
+yay -S rustinfo-full-git "$(cat /usr/lib/modules/"$(uname -r)"/pkgbase)-headers"
+```
+
+`rustinfo-full-git` 会安装主程序、SMU 遥测模块源码与 DKMS,并在经过平台检查后自动加载
+遥测模块。内核升级后的模块构建交给 DKMS;Clang/LTO 内核会自动使用 LLVM 工具链。
+只要监控与负压写入则安装 `rustinfo-git`,不需要 DKMS。包安装不会自动设置负压值;
+root 功能使用 `sudo rustinfo`,不创建免密 sudo 规则。
+
+### 从源码安装
+
 **前置**:Rust 工具链(没有就先装 rustup:`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y`)。Linux + systemd 任意发行版;内核越新传感器越全。
 
 ### 方式一:cargo 直接安装(最简单)
@@ -110,7 +126,7 @@ sudo cat /sys/kernel/debug/rustinfo_smu/info    # 版本/基址/邮箱
 sudo cat /sys/kernel/debug/rustinfo_smu/table > table.bin   # 每次读都是新鲜数据
 ```
 
-安全说明:模块**只含四个只读命令**(0x02/0x06/0x66/0x65),不向固件发送任何写值命令(CO、限值碰都不碰);所有交互带超时、返回码校验、互斥锁串行化。模块是 `insmod` 手动加载的,**重启后消失**,验证稳定前不会放进开机流程。
+安全说明:模块**只含四个只读命令**(0x02/0x06/0x66/0x65),不向固件发送任何写值命令(CO、限值碰都不碰);所有交互带超时、返回码校验、互斥锁串行化。手动 `insmod` 加载时,**重启后消失**;`rustinfo-full-git` 则在已验证的 Strix Point 平台上通过 systemd 自动加载遥测模块,并在有竞争驱动时拒绝自动加载。
 
 ### 已验证字段(已接入 TUI/CSV,芯片名 `smu`)
 

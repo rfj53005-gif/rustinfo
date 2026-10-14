@@ -1,0 +1,72 @@
+# rustinfo upstream AUR recipe. Add the AUR maintainer's name before submitting.
+pkgbase=rustinfo-git
+pkgname=('rustinfo-git' 'rustinfo-smu-dkms-git' 'rustinfo-full-git')
+pkgver=0.2.0.r18.gd1ba5f3
+pkgrel=1
+pkgdesc='Linux hardware monitor with a terminal dashboard and AMD SMU control'
+arch=('x86_64')
+url='https://github.com/rfj53005-gif/rustinfo'
+license=('MIT')
+makedepends=('git' 'cargo')
+options=('!lto' '!debug')
+source=("rustinfo::git+${url}.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$srcdir/rustinfo"
+    local version
+    version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+    printf '%s.r%s.g%s' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+    cd "$srcdir/rustinfo"
+    cargo fetch --locked --target x86_64-unknown-linux-gnu
+}
+
+build() {
+    cd "$srcdir/rustinfo"
+    cargo build --frozen --release --target x86_64-unknown-linux-gnu
+}
+
+package_rustinfo-git() {
+    depends=('gcc-libs' 'glibc')
+    optdepends=('rustinfo-smu-dkms: SMU telemetry on AMD Strix Point')
+    provides=("rustinfo=$pkgver")
+    conflicts=('rustinfo')
+
+    cd "$srcdir/rustinfo"
+    install -Dm755 target/x86_64-unknown-linux-gnu/release/rustinfo "$pkgdir/usr/bin/rustinfo"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/rustinfo/README.md"
+}
+
+package_rustinfo-smu-dkms-git() {
+    pkgdesc='Read-only AMD Strix Point SMU telemetry module sources for DKMS'
+    license=('GPL-2.0-only')
+    depends=('dkms' 'clang' 'llvm' 'lld')
+    optdepends=('linux-headers: headers matching the installed kernel (or its custom kernel variant)')
+    provides=("rustinfo-smu-dkms=$pkgver")
+    conflicts=('rustinfo-smu-dkms')
+
+    cd "$srcdir/rustinfo"
+    local module_dir="$pkgdir/usr/src/rustinfo_smu-$pkgver"
+    install -Dm644 module/rustinfo_smu.c "$module_dir/rustinfo_smu.c"
+    install -Dm644 module/Makefile "$module_dir/Makefile"
+    sed -e "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"$pkgver\"/" \
+        -e '/^CLEAN=/d' \
+        module/dkms.conf > "$module_dir/dkms.conf"
+}
+
+package_rustinfo-full-git() {
+    pkgdesc='Complete hardware monitor and automatic Strix Point SMU telemetry setup'
+    depends=("rustinfo-git=$pkgver-$pkgrel" "rustinfo-smu-dkms-git=$pkgver-$pkgrel" 'systemd' 'kmod' 'gawk')
+
+    cd "$srcdir/rustinfo"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm755 packaging/aur/rustinfo-smu-supported "$pkgdir/usr/lib/rustinfo/smu-supported"
+    install -Dm644 packaging/aur/rustinfo-smu.service "$pkgdir/usr/lib/systemd/system/rustinfo-smu.service"
+    install -Dm644 packaging/aur/95-rustinfo-smu.hook "$pkgdir/usr/share/libalpm/hooks/95-rustinfo-smu.hook"
+    install -d "$pkgdir/usr/lib/systemd/system/multi-user.target.wants"
+    ln -s ../rustinfo-smu.service "$pkgdir/usr/lib/systemd/system/multi-user.target.wants/rustinfo-smu.service"
+}

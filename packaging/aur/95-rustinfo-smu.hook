@@ -1,0 +1,13 @@
+[Trigger]
+Operation=Install
+Operation=Upgrade
+Type=Path
+Target=usr/lib/systemd/system/rustinfo-smu.service
+Target=usr/src/rustinfo_smu-*/dkms.conf
+Target=usr/lib/modules/*/build/include/
+
+[Action]
+Description=Starting rustinfo SMU telemetry after DKMS installation...
+When=PostTransaction
+Depends=systemd
+Exec=/usr/bin/systemctl start rustinfo-smu.service
