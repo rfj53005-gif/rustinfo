@@ -13,12 +13,12 @@ HWiNFO 风格的 Linux 硬件监控,纯 Rust 实现。实时 TUI 面板 + 一次
 
 ## 安装
 
-**前置**:Rust 工具链(没有就先装 rustup:`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y`)。Linux + systemd 任意发行版;内核越新传感器越全。
+**前置**:Rust 1.88 或更新版本(没有就先装 rustup:`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y`)。Linux + systemd 任意发行版;内核越新传感器越全。
 
 ### 方式一:cargo 直接安装(最简单)
 
 ```bash
-cargo install --git https://github.com/rfj53005-gif/rustinfo
+cargo install --locked --git https://github.com/rfj53005-gif/rustinfo
 rustinfo          # 直接运行 (在 ~/.cargo/bin)
 ```
 
@@ -26,7 +26,7 @@ rustinfo          # 直接运行 (在 ~/.cargo/bin)
 
 ```bash
 git clone https://github.com/rfj53005-gif/rustinfo && cd rustinfo
-cargo build --release
+cargo build --locked --release
 ./target/release/rustinfo dump
 ```
 
@@ -36,7 +36,7 @@ cargo build --release
 ./install.sh
 ```
 
-它做四件事:① `cargo build --release`;② 把二进制复制一份 **root 属主副本**到 `/usr/local/bin/rustinfo`;③ 写一条只对这一个文件生效的 sudoers 免密规则(`/etc/sudoers.d/rustinfo`);④ 在 `~/.local/bin/rustinfo` 放一个包装器,自动免密 `sudo` 运行。改代码后重跑一次即可同步(sudoers 只创建一次)。**不想要 sudo 规则就不跑这个脚本**,用手动 `sudo rustinfo` 一样能拿全量读数。
+它做四件事:① `cargo build --locked --release`;② 把二进制复制一份 **root 属主副本**到 `/usr/local/bin/rustinfo`;③ 写一条只对这一个文件生效的 sudoers 免密规则(`/etc/sudoers.d/rustinfo`);④ 在 `~/.local/bin/rustinfo` 放一个包装器,自动免密 `sudo` 运行。改代码后重跑一次即可同步(sudoers 只创建一次)。**不想要 sudo 规则就不跑这个脚本**,用手动 `sudo rustinfo` 一样能拿全量读数。
 
 > 需要图形会话的 polkit 授权(pkexec);纯 TTY 下请手动执行脚本里的步骤。
 
@@ -55,6 +55,8 @@ rustinfo -i 0.5     # 采样间隔 0.5 秒 (0.2~60)
 | `空格` | 暂停/恢复采样 |
 | `l` | 开始/停止 CSV 记录(文件在当前目录,文件名显示在底部) |
 | `+` / `-` | 增大/减小采样间隔 |
+| `PgUp` / `PgDn`、`Home` / `End` | 滚动传感器区、跳至开头/末尾 |
+| `Ctrl-C` | 退出面板;CSV 模式会刷新文件后退出 |
 
 ### 一次性读数(脚本友好)
 
@@ -70,6 +72,8 @@ rustinfo dump
 rustinfo log soak.csv -i 2        # 每 2 秒一行, Ctrl-C 结束
 rustinfo log -i 1                 # 不指定文件名则自动 rustinfo_时间戳.csv
 ```
+
+CSV 列在开始记录时固定,设备暂时消失会留空,新插入的设备需重新开启记录以加入列。重名设备/标签会使用 `#2`、`#3` 等后缀区分,读数按设备身份匹配,不会因另一台设备消失而串列。
 
 列名规则:`<芯片>.<读数>_<单位>`,例如 `k10temp.Tctl_C`、`amdgpu.PPT_W`、`rapl.C00_W`(C00-C13 是硬件核编号)、每线程为 `t00_pct`/`t00_mhz`。电压电流是瞬时值,功率/速率/占用率是两次采样间的增量均值。
 
@@ -144,11 +148,11 @@ sudo cat /sys/kernel/debug/rustinfo_smu/table > table.bin   # 每次读都是新
 
 ## smuctl:SMU 直控(替代 ryzenadj,Zen 5 实测)
 
-`smuctl` 是本项目的 SMU 直控子命令,通过自研 RSMU/MP1 邮箱通道(Strix Point: cmd `0x3B10928` / rsp `0x3B10978` / args `0x3B10998`,SMN 桥走 00:00.0 config `0xB8`/`0xBC`)直接发送 PMFW 消息,对 AMD Zen 5 移动平台(family 0x1A:Strix Point / Strix Halo / Krackan Point)提供 ryzenadj 缺失或已损坏的能力:
+`smuctl` 是本项目的 SMU 直控子命令,通过自研 RSMU/MP1 邮箱通道(Strix Point: cmd `0x3B10928` / rsp `0x3B10978` / args `0x3B10998`,SMN 桥走 00:00.0 config `0xB8`/`0xBC`)直接发送 PMFW 消息,默认在实测的 AMD Strix Point(family 0x1A、model 0x24)上提供以下能力。其他 CPU 的硬件监控仍可运行,SMU 直控需明确选择实验性覆盖。以下 RyzenAdj 0.19 对比是当时实测版本的记录:
 
 | 能力 | ryzenadj 0.19 | rustinfo smuctl |
 |---|---|---|
-| 全核 CO(`--set-coall`) | ✅ 但需手写 28 位补码 `0xfffffe5` | ✅ 直接写 `-27`,自动编码 + **arg0 读回确认** |
+| 全核 CO(`--set-coall`) | ✅ 但需手写 28 位补码 `0xfffffe5` | ✅ 直接写 `-27`,自动编码 + **固件响应码与返回参数** |
 | pm_table 遥测(`--dump-table`) | ❌ 被 IO_STRICT_DEVMEM 拦截(无法初始化) | ✅ `smu-table` + 只读内核模块(memremap) |
 | 每核功率 / 时钟 / VID | ❌ | ✅ 逐核钉载差分破译,已接入 TUI/CSV |
 | PSI0 电流限制 / APU 慢速功耗墙 | ❌ ryzenadj 无此接口 | ✅ `psi0-current` / `apu-slow-limit`(0x1E / 0x23,判别实验实锤) |
@@ -164,9 +168,12 @@ sudo rustinfo smuctl stapm-limit 25000
 
 已知坑与语义备注:
 
-- **平台守卫**:smu-probe / smu-table / smuctl 写路径默认只在 CPU family 26 (0x1A) 上运行,其他平台直接拒绝(邮箱 SMN 地址按 family 硬编码,误写有硬件风险);自负风险可用 `RUSTINFO_SMU_FORCE=1` 跳过。
-- **CO 是 28 位补码**:-27 → `0x0FFFFFE5`;按 32 位直觉写 `0xFFFFFFE5` 会被 PMFW 拒绝(Failed)——ryzenadj 未文档化的坑,smuctl 自动处理。`0x` 前缀值按原始 arg 直通(如 `co 0x0FFFFFE5` ≡ `co -27`)。
+- **平台守卫**:smu-probe / smu-table / smuctl 默认要求 AMD family 26 (0x1A)、model 36 (0x24),并验证 PCI 00:00.0 的 AMD 厂商 ID。自负风险可用 `RUSTINFO_SMU_FORCE=1` 跳过 CPU 检查;它不会跳过 PCI 厂商检查。内核模块也只在上述实测平台加载。
+- **CO 是 28 位补码**:-27 → `0x0FFFFFE5`;按 32 位直觉写 `0xFFFFFFE5` 会在参数检查阶段被拒绝——ryzenadj 未文档化的坑,smuctl 自动处理。`0x` 前缀值按原始 arg 解析并校验位宽(如 `co 0x0FFFFFE5` ≡ `co -27`)。
 - `0x1E`/`0x23` 语义判别:UXTU 映射 psi0-current / apu-slow-limit;ryzenadj 与内核 SMU14 头的 FCLK 说法均为误映射(判别实验:45000 被接受且不钉频、不限功耗)。
+- **返回参数不是独立读回**:OK 表示固件接受了命令;CO 是否生效与是否稳定需要用相同负载下的电压、功率和长时间测试验证。
+- **进程协调**:用户态 SMN 事务使用 `/run/lock/rustinfo-smu.lock` 防止多个 rustinfo 进程交错访问;这个锁不约束 RyzenAdj 或其他驱动。已加载模块时,smu-probe / smu-table 优先走其 debugfs,不再先发竞争的用户态探测命令。
+- **遥测版本**:监控解码仅采信已验证的 `0x5D0009` 表;未知版本不会沿用固定偏移。
 - 所有写入均为易失状态,重启回 BIOS 默认;持久化走 systemd + 浸泡验证铁律。
 - GPU CO(PSMU 邮箱 0xB7):Strix Point 上**消息存在但被前置条件锁死**——判别实验:0xB7 返回 RejectedPrereq(非 UnknownCmd,说明消息有效),enable-oc 在 MP1/PSMU 两侧、GPU 活跃/空闲状态下均无法解锁,与 Strix Halo 的平台限制(#387)同模式,疑似 OEM 固件锁。
 
@@ -206,3 +213,17 @@ sysfs `intel-rapl:0:0` 名叫 "core",实测证明它**不是全部核心的合�
 - [RyzenAdj (FlyGoat)](https://github.com/FlyGoat/RyzenAdj) — 本机 CO 调整工作流的核心工具,其 SMU 服务实现是本项目邮箱协议的参考之一
 - [ryzen_smu (leogx9r)](https://github.com/leogx9r/ryzen_smu) — SMN 桥寄存器布局与邮箱握手流程的参考实现
 - [ratatui](https://ratatui.rs/) 与 [awesome-ratatui](https://github.com/ratatui/awesome-ratatui) 生态中的监控类 TUI 架构
+
+## 开发与验证
+
+[架构说明](docs/architecture.md)列出了采集器职责、计数器采样规则、CSV 身份映射和 SMU 访问边界。
+运行统一检查:
+
+```bash
+./scripts/check.sh
+```
+
+它执行格式检查、全部 target 的 Clippy 严格检查与测试。单元测试使用临时 procfs/sysfs
+文件和模拟邮箱;CLI 集成测试检查错误退出码、非终端启动和 CSV 的 Ctrl-C 收尾。
+后者会读取本机常规只读监控接口,测试不会执行有效 SMU 写参数命令。内核模块另用
+`make -C module LLVM=1` 验证(CachyOS/Clang 内核);模块编译不等于已加载或完成硬件写入测试。

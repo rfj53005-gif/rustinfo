@@ -16,8 +16,8 @@
 #include <linux/mm.h>
 #include <linux/io.h>
 #include <linux/slab.h>
-#include <linux/mm.h>
 #include <linux/string.h>
+#include <asm/processor.h>
 
 #define SMN_ADDR_REG 0xC4
 #define SMN_DATA_REG 0xC8
@@ -32,13 +32,14 @@ static DEFINE_MUTEX(smu_lock);
 static u32 mb_cmd, mb_rsp, mb_args;
 static u32 smu_ver, tbl_ver;
 static u32 smn_probe_val;
-static u32 smn_dump_start, smn_dump_len;
+static u32 smn_dump_len;
 static u8 *smn_dump_buf;
 static u64 dram_base;
 static void *mapped;
 static u8 *table_buf;
 static struct dentry *dbg;
 static u32 smn_probe_addr;
+static bool smn_probe_valid;
 
 /* 已知邮箱候选 (来自 ryzen_smu 各代号表, RSMU-APU 优先) */
 static const struct { u32 cmd, rsp, args; } mb_cands[] = {
@@ -53,16 +54,16 @@ static int smn_read(u32 addr, u32 *val)
 {
 	int err = pci_write_config_dword(smn_pdev, SMN_ADDR_REG, addr);
 	if (err)
-		return err;
-	return pci_read_config_dword(smn_pdev, SMN_DATA_REG, val);
+		return pcibios_err_to_errno(err);
+	return pcibios_err_to_errno(pci_read_config_dword(smn_pdev, SMN_DATA_REG, val));
 }
 
 static int smn_write(u32 addr, u32 val)
 {
 	int err = pci_write_config_dword(smn_pdev, SMN_ADDR_REG, addr);
 	if (err)
-		return err;
-	return pci_write_config_dword(smn_pdev, SMN_DATA_REG, val);
+		return pcibios_err_to_errno(err);
+	return pcibios_err_to_errno(pci_write_config_dword(smn_pdev, SMN_DATA_REG, val));
 }
 
 /* 六步握手; 返回 0 成功, 否则负 errno。tmp 非 0x01 视为固件拒绝。 */
@@ -170,18 +171,9 @@ static ssize_t info_read(struct file *filp, char __user *ubuf, size_t cnt,
 static ssize_t raw_read(struct file *filp, char __user *ubuf, size_t cnt,
 			loff_t *ppos)
 {
-	loff_t avail = CARVEOUT_SIZE;
-
 	if (!mapped)
 		return -ENODEV;
-	if (*ppos >= avail)
-		return 0;
-	if (cnt > avail - *ppos)
-		cnt = avail - *ppos;
-	if (copy_to_user(ubuf, (u8 *)mapped + *ppos, cnt))
-		return -EFAULT;
-	*ppos += cnt;
-	return cnt;
+	return simple_read_from_buffer(ubuf, cnt, ppos, mapped, CARVEOUT_SIZE);
 }
 
 /* 任意 SMN 地址读取: echo <hex addr> > smn_addr; cat smn_val */
@@ -189,6 +181,7 @@ static ssize_t smn_addr_write(struct file *filp, const char __user *ubuf,
 			      size_t cnt, loff_t *ppos)
 {
 	char kbuf[16];
+	u32 addr, val;
 	int err;
 
 	if (cnt >= sizeof(kbuf))
@@ -196,12 +189,19 @@ static ssize_t smn_addr_write(struct file *filp, const char __user *ubuf,
 	if (copy_from_user(kbuf, ubuf, cnt))
 		return -EFAULT;
 	kbuf[cnt] = 0;
-	err = kstrtouint(strim(kbuf), 0, &smn_probe_addr);
+	err = kstrtouint(strim(kbuf), 0, &addr);
 	if (err)
 		return err;
 	mutex_lock(&smu_lock);
-	err = smn_read(smn_probe_addr, &smn_probe_val);
+	err = smn_read(addr, &val);
+	if (!err) {
+		smn_probe_addr = addr;
+		smn_probe_val = val;
+		smn_probe_valid = true;
+	}
 	mutex_unlock(&smu_lock);
+	if (err)
+		return err;
 	return cnt;
 }
 
@@ -212,7 +212,7 @@ static ssize_t smn_val_read(struct file *filp, char __user *ubuf, size_t cnt,
 	int n;
 
 	mutex_lock(&smu_lock);
-	if (!smn_probe_addr) {
+	if (!smn_probe_valid) {
 		mutex_unlock(&smu_lock);
 		return 0;
 	}
@@ -257,21 +257,26 @@ static ssize_t smn_dump_write(struct file *filp, const char __user *ubuf,
 	err = sscanf(strim(kbuf), "%x %x", &start, &len);
 	if (err != 2)
 		return -EINVAL;
-	if (len == 0 || len > 0x2000000 || len % 4)
+	if (len == 0 || len > 0x2000000 || len % 4 || start % 4 ||
+	    (u64)start + len > (1ULL << 32))
 		return -EINVAL;
 
 	mutex_lock(&smu_lock);
 	kvfree(smn_dump_buf);
+	smn_dump_len = 0;
 	smn_dump_buf = kvzalloc(len, GFP_KERNEL);
 	if (!smn_dump_buf) {
 		smn_dump_len = 0;
 		mutex_unlock(&smu_lock);
 		return -ENOMEM;
 	}
-	smn_dump_start = start;
 	for (u32 off = 0; off < len; off += 4) {
 		u32 v = 0xFFFFFFFF;
-		smn_read(start + off, &v);
+		err = smn_read(start + off, &v);
+		if (err) {
+			mutex_unlock(&smu_lock);
+			return err;
+		}
 		*(u32 *)(smn_dump_buf + off) = v;
 		udelay(1);            /* 节流: 背靠背访问会打断 SMN 桥 */
 		if ((off & 0xFFFF) == 0)
@@ -285,18 +290,14 @@ static ssize_t smn_dump_write(struct file *filp, const char __user *ubuf,
 static ssize_t smn_dump_read(struct file *filp, char __user *ubuf, size_t cnt,
 			     loff_t *ppos)
 {
-	loff_t avail = smn_dump_len;
+	ssize_t ret;
 
-	if (!smn_dump_buf)
-		return -ENODATA;
-	if (*ppos >= avail)
-		return 0;
-	if (cnt > avail - *ppos)
-		cnt = avail - *ppos;
-	if (copy_to_user(ubuf, smn_dump_buf + *ppos, cnt))
-		return -EFAULT;
-	*ppos += cnt;
-	return cnt;
+	/* smn_dump_write can replace/free the buffer while another fd reads it. */
+	mutex_lock(&smu_lock);
+	ret = smn_dump_buf ? simple_read_from_buffer(ubuf, cnt, ppos,
+						smn_dump_buf, smn_dump_len) : -ENODATA;
+	mutex_unlock(&smu_lock);
+	return ret;
 }
 
 static const struct file_operations smn_dump_fops = {
@@ -317,9 +318,20 @@ static int __init rustinfo_smu_init(void)
 	u32 out[6];
 	int i, ret;
 
+	if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD ||
+	    boot_cpu_data.x86 != 0x1A || boot_cpu_data.x86_model != 0x24) {
+		pr_info("rustinfo_smu: unsupported CPU; requires AMD Strix Point\n");
+		return -ENODEV;
+	}
+
 	smn_pdev = pci_get_domain_bus_and_slot(0, 0, PCI_DEVFN(0, 0));
 	if (!smn_pdev) {
 		pr_err("rustinfo_smu: 未找到 PCI 00:00.0\n");
+		return -ENODEV;
+	}
+
+	if (smn_pdev->vendor != PCI_VENDOR_ID_AMD) {
+		pci_dev_put(smn_pdev);
 		return -ENODEV;
 	}
 

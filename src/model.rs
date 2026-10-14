@@ -1,6 +1,6 @@
 use chrono::{DateTime, Local};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Unit {
     TempC,
     Volts,
@@ -60,6 +60,8 @@ impl Unit {
 
 #[derive(Clone, Debug)]
 pub struct Reading {
+    /// Kernel attribute name, when a device exposes duplicate display labels.
+    pub key: Option<String>,
     pub label: String,
     pub value: f64,
     pub unit: Unit,
@@ -67,12 +69,15 @@ pub struct Reading {
 
 #[derive(Clone, Debug)]
 pub struct Chip {
+    /// Source identity stays distinct even when two devices share a display name.
+    pub id: String,
     pub name: String,
     pub readings: Vec<Reading>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct CpuSnapshot {
+    pub ids: Vec<usize>,
     pub model: String,
     pub total_pct: f32,
     pub per_pct: Vec<f32>,
@@ -111,6 +116,7 @@ pub struct VramSnapshot {
     pub gtt_used_mib: Option<f64>,
 }
 
+#[derive(Default)]
 pub struct Snapshot {
     pub time: DateTime<Local>,
     pub hostname: String,

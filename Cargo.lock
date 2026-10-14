@@ -469,7 +469,9 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "libc",
  "ratatui",
+ "signal-hook",
 ]
 
 [[package]]

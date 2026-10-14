@@ -1,36 +1,210 @@
-//! SMU 自研通道: SMN 桥 + RSMU/MP1 邮箱 + pm_table 抓取。
-//! 协议参考 ryzen_smu / ryzenadj; 只发只读类命令, 全部交互带超时与返回码校验。
-
+//! Serialized userspace SMN transport and the read-only Strix Point mailbox tools.
+use crate::platform::CpuIdentity;
+use anyhow::{bail, Context, Result};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::FileExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-
 const CFG_PATH: &str = "/sys/bus/pci/devices/0000:00:00.0/config";
-
-/// SMN 桥候选: (index 偏移, data 偏移), 均在 00:00.0 config 空间
 const SMN_BRIDGES: &[(u64, u64)] = &[(0xC4, 0xC8), (0xB8, 0xBC)];
 
-/// 邮箱候选: (名称, cmd, rsp, args) — SMN 地址, 来自 ryzen_smu 各代号表
-const MAILBOXES: &[(&str, u32, u32, u32)] = &[
-    ("RSMU-APU", 0x3B10_A20, 0x3B10_A80, 0x3B10_A88),
-    ("MP1-IFv13", 0x3B10_528, 0x3B10_578, 0x3B10_998),
-    ("MP1-IFv12", 0x3B10_528, 0x3B10_564, 0x3B10_998),
-    ("RSMU-桌面", 0x3B10_524, 0x3B10_570, 0x3B10_A40),
-    ("MP1-IFv11", 0x3B10_530, 0x3B10_57C, 0x3B10_9C4),
-    ("MP1-IFv9", 0x3B10_528, 0x3B10_564, 0x3B10_598),
-    ("RSMU-TR", 0x3B10_51C, 0x3B10_568, 0x3B10_590),
+#[derive(Clone, Copy)]
+pub struct Mailbox {
+    pub name: &'static str,
+    pub msg: u32,
+    pub rsp: u32,
+    pub arg: u32,
+}
+pub const CONTROL: Mailbox = Mailbox {
+    name: "Strix MP1",
+    msg: 0x3B10_928,
+    rsp: 0x3B10_978,
+    arg: 0x3B10_998,
+};
+const TABLE: Mailbox = Mailbox {
+    name: "RSMU-APU",
+    msg: 0x3B10_A20,
+    rsp: 0x3B10_A80,
+    arg: 0x3B10_A88,
+};
+const MAILBOXES: &[Mailbox] = &[
+    TABLE,
+    Mailbox {
+        name: "MP1-IFv13",
+        msg: 0x3B10_528,
+        rsp: 0x3B10_578,
+        arg: 0x3B10_998,
+    },
+    Mailbox {
+        name: "MP1-IFv12",
+        msg: 0x3B10_528,
+        rsp: 0x3B10_564,
+        arg: 0x3B10_998,
+    },
+    Mailbox {
+        name: "RSMU-桌面",
+        msg: 0x3B10_524,
+        rsp: 0x3B10_570,
+        arg: 0x3B10_A40,
+    },
+    Mailbox {
+        name: "MP1-IFv11",
+        msg: 0x3B10_530,
+        rsp: 0x3B10_57C,
+        arg: 0x3B10_9C4,
+    },
+    Mailbox {
+        name: "MP1-IFv9",
+        msg: 0x3B10_528,
+        rsp: 0x3B10_564,
+        arg: 0x3B10_598,
+    },
+    Mailbox {
+        name: "RSMU-TR",
+        msg: 0x3B10_51C,
+        rsp: 0x3B10_568,
+        arg: 0x3B10_590,
+    },
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Ok,
+    Failed,
+    UnknownCommand,
+    Prerequisite,
+    Busy,
+    Other(u32),
+}
+impl Status {
+    fn from_code(code: u32) -> Self {
+        match code {
+            1 => Self::Ok,
+            0xff => Self::Failed,
+            0xfe => Self::UnknownCommand,
+            0xfd => Self::Prerequisite,
+            0xfc => Self::Busy,
+            other => Self::Other(other),
+        }
+    }
+}
+impl fmt::Display for Status {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ok => f.write_str("OK"),
+            Self::Failed => f.write_str("Failed"),
+            Self::UnknownCommand => f.write_str("UnknownCmd"),
+            Self::Prerequisite => f.write_str("RejectedPrereq"),
+            Self::Busy => f.write_str("Busy"),
+            Self::Other(code) => write!(f, "0x{code:X}"),
+        }
+    }
+}
+pub struct Reply {
+    pub status: Status,
+    pub args: [u32; 6],
+}
+impl Reply {
+    pub fn ensure_ok(self) -> Result<[u32; 6]> {
+        if self.status != Status::Ok {
+            bail!("SMU 响应: {}", self.status)
+        }
+        Ok(self.args)
+    }
+}
+
+trait RegisterIo {
+    fn read(&self, address: u32) -> Result<u32>;
+    fn write(&self, address: u32, value: u32) -> Result<()>;
+}
+struct Timing {
+    ready: Duration,
+    response: Duration,
+    poll: Duration,
+}
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            ready: Duration::from_millis(500),
+            response: Duration::from_millis(1500),
+            poll: Duration::from_micros(100),
+        }
+    }
+}
+
+fn wait_response(
+    io: &impl RegisterIo,
+    address: u32,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<u32> {
+    let start = Instant::now();
+    loop {
+        let status = io.read(address)?;
+        if status != 0 {
+            return Ok(status);
+        }
+        if start.elapsed() >= timeout {
+            bail!("SMU 响应寄存器 0x{address:X} 等待超时")
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+fn exchange(
+    io: &impl RegisterIo,
+    mailbox: Mailbox,
+    operation: u32,
+    args: [u32; 6],
+    timing: &Timing,
+) -> Result<Reply> {
+    wait_response(io, mailbox.rsp, timing.ready, timing.poll).context("邮箱初始等待")?;
+    io.write(mailbox.rsp, 0)?;
+    for (index, value) in args.iter().enumerate() {
+        io.write(mailbox.arg + index as u32 * 4, *value)?;
+    }
+    io.write(mailbox.msg, operation)?;
+    let code = wait_response(io, mailbox.rsp, timing.response, timing.poll)
+        .with_context(|| format!("命令 0x{operation:X}"))?;
+    let status = Status::from_code(code);
+    let mut args = [0u32; 6];
+    if status == Status::Ok {
+        for (index, value) in args.iter_mut().enumerate() {
+            *value = io.read(mailbox.arg + index as u32 * 4)?;
+        }
+    }
+    Ok(Reply { status, args })
+}
 
 pub struct Smn {
     cfg: File,
-    idx_reg: u64,
-    data_reg: u64,
+    index: u64,
+    data: u64,
+    _lock: File,
 }
-
 impl Smn {
-    pub fn open(idx_reg: u64, data_reg: u64) -> Result<Self> {
+    pub fn open(index: u64, data: u64) -> Result<Self> {
+        let vendor = fs::read_to_string("/sys/bus/pci/devices/0000:00:00.0/vendor")
+            .context("读取 PCI Host Bridge 厂商")?;
+        if vendor.trim() != "0x1022" {
+            bail!("PCI 00:00.0 不是 AMD Host Bridge, 拒绝访问 SMN")
+        }
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open("/run/lock/rustinfo-smu.lock")
+            .context("打开 SMU 锁失败 (需 root)")?;
+        // SAFETY: flock operates on the valid descriptor owned by lock; closing releases it.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("另一个 rustinfo 进程正在访问 SMU");
+        }
         let cfg = OpenOptions::new()
             .read(true)
             .write(true)
@@ -38,232 +212,253 @@ impl Smn {
             .with_context(|| format!("打开 {CFG_PATH} 失败 (需 root)"))?;
         Ok(Self {
             cfg,
-            idx_reg,
-            data_reg,
+            index,
+            data,
+            _lock: lock,
         })
     }
-
-    pub fn smn_read(&self, addr: u32) -> Result<u32> {
-        self.cfg.write_at(&addr.to_le_bytes(), self.idx_reg)?;
-        let mut b = [0u8; 4];
-        self.cfg.read_exact_at(&mut b, self.data_reg)?;
-        Ok(u32::from_le_bytes(b))
+    pub fn send_command(&self, mailbox: Mailbox, operation: u32, args: [u32; 6]) -> Result<Reply> {
+        exchange(self, mailbox, operation, args, &Timing::default())
     }
-
-    pub fn smn_write(&self, addr: u32, val: u32) -> Result<()> {
-        self.cfg.write_at(&addr.to_le_bytes(), self.idx_reg)?;
-        self.cfg.write_at(&val.to_le_bytes(), self.data_reg)?;
+}
+impl RegisterIo for Smn {
+    fn read(&self, address: u32) -> Result<u32> {
+        self.cfg.write_all_at(&address.to_le_bytes(), self.index)?;
+        let mut bytes = [0u8; 4];
+        self.cfg.read_exact_at(&mut bytes, self.data)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+    fn write(&self, address: u32, value: u32) -> Result<()> {
+        self.cfg.write_all_at(&address.to_le_bytes(), self.index)?;
+        self.cfg.write_all_at(&value.to_le_bytes(), self.data)?;
         Ok(())
     }
-
-    /// ryzen_smu 六步握手: 等 RSP 非零 → 清零 → 写参数 → 写命令 → 等 RSP → 读参数
-    pub fn send_command(
-        &self,
-        rsp: u32,
-        cmd: u32,
-        args_addr: u32,
-        op: u32,
-        args: [u32; 6],
-    ) -> Result<(u32, [u32; 6])> {
-        let mut deadline = Instant::now() + Duration::from_millis(500);
-        let mut tmp;
-        loop {
-            tmp = self.smn_read(rsp)?;
-            if tmp != 0 || Instant::now() >= deadline {
-                break;
-            }
-        }
-        if tmp == 0 {
-            bail!("RSP 0x{rsp:X} 初始等待超时");
-        }
-        self.smn_write(rsp, 0)?;
-        for (i, a) in args.iter().enumerate() {
-            self.smn_write(args_addr + i as u32 * 4, *a)?;
-        }
-        self.smn_write(cmd, op)?;
-        deadline = Instant::now() + Duration::from_millis(1500);
-        loop {
-            tmp = self.smn_read(rsp)?;
-            if tmp != 0 || Instant::now() >= deadline {
-                break;
-            }
-        }
-        if tmp == 0 {
-            bail!("命令 0x{op:X} 处理超时");
-        }
-        let mut ret = [0u32; 6];
-        for (i, r) in ret.iter_mut().enumerate() {
-            *r = self.smn_read(args_addr + i as u32 * 4)?;
-        }
-        Ok((tmp, ret))
-    }
 }
 
-fn version_str(v: u32) -> String {
-    format!("{}.{}.{}", (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff)
-}
-
-/// SMU 探针/直控仅限 CPU family 26 (0x1A, Zen 5 移动: Strix/Krackan/Strix Halo) —
-/// 邮箱 SMN 地址与消息表按该家族硬编码, 其他平台误写这些地址有硬件风险。
-/// 自负风险跳过: RUSTINFO_SMU_FORCE=1
 pub fn require_supported_cpu() -> Result<()> {
-    if std::env::var_os("RUSTINFO_SMU_FORCE").is_some_and(|v| v == "1") {
+    if std::env::var_os("RUSTINFO_SMU_FORCE").is_some_and(|value| value == "1") {
         return Ok(());
     }
-    let s = fs::read_to_string("/proc/cpuinfo").context("读 /proc/cpuinfo")?;
-    let fam = s.lines().find_map(|l| {
-        l.strip_prefix("cpu family")?
-            .split(':')
-            .nth(1)?
-            .trim()
-            .parse::<u32>()
-            .ok()
-    });
-    match fam {
-        Some(26) => Ok(()),
-        Some(f) => bail!(
-            "CPU family {f} (0x{f:X}) 未验证 — smu/smuctl 的邮箱与消息表仅适配 family 26 (0x1A, Zen 5 移动)。确要尝试: RUSTINFO_SMU_FORCE=1"
-        ),
-        None => bail!("无法识别 CPU family。确要尝试: RUSTINFO_SMU_FORCE=1"),
+    let identity =
+        CpuIdentity::parse(&fs::read_to_string("/proc/cpuinfo").context("读 /proc/cpuinfo")?);
+    if !identity.supports_smu() {
+        bail!("CPU 未验证 ({}/{:?}/{:?}): SMU 邮箱仅验证 AMD Strix Point family 0x1A/model 0x24; 显式跳过检查: RUSTINFO_SMU_FORCE=1",identity.vendor,identity.family,identity.model)
     }
-}
-
-/// pm_table 抓取: 版本 → DRAM 基址 → 触发传输 → /dev/mem 只读读取。
-/// 只用 APU 类(Renoir/Cezanne 系)已文档化的三个只读命令号,
-/// 任何一个返回 UnknownCmd 就停下, 不盲试其他命令号。
-pub fn smu_table() -> Result<()> {
-    require_supported_cpu()?;
-    let smn = Smn::open(0xC4, 0xC8)?;
-    const CMD: u32 = 0x3B10_A20; // RSMU-APU (探针已验证)
-    const RSP: u32 = 0x3B10_A80;
-    const ARGS: u32 = 0x3B10_A88;
-
-    println!("== 1/4 pm_table 版本 (cmd 0x06) ==");
-    let (ret, a) = smn.send_command(RSP, CMD, ARGS, 0x06, [0; 6])?;
-    if ret != 0x01 {
-        bail!("返回 0x{ret:02X} (0xFE=UnknownCmd → 这代命令号可能平移, 需查 ryzenadj 源码)");
-    }
-    println!("  pm_table 版本 0x{:06X}", a[0]);
-
-    println!("== 2/4 DRAM 基址 (cmd 0x66) ==");
-    let (ret, a) = smn.send_command(RSP, CMD, ARGS, 0x66, [1, 1, 0, 0, 0, 0])?;
-    if ret != 0x01 {
-        bail!("返回 0x{ret:02X}");
-    }
-    let base = a[0] as u64 | (a[1] as u64) << 32;
-    if base == 0 || base > 0x0000_8000_0000_0000 {
-        bail!("基址异常: 0x{base:X}");
-    }
-    println!("  SMU 保留区基址 0x{base:012X}");
-
-    println!("== 3/4 /proc/iomem 安全校验 ==");
-    let (label, avail) = iomem_region(base)?;
-    println!("  区域「{label}」从基址起可读 {avail:#X} 字节");
-    if label.to_lowercase().contains("system ram") {
-        bail!("目标落在 System RAM — 拒绝读取 (安全护栏)");
-    }
-    let len = avail.min(0x1000);
-    if len < 0x100 {
-        bail!("可读区域过小 ({len:#X})");
-    }
-
-    println!("== 4/4 表传输 (cmd 0x65) + 只读读取 ==");
-    let out = "/tmp/smu_pm_table.bin";
-    let buf = if let Ok(b) = fs::read("/sys/kernel/debug/rustinfo_smu/table") {
-        // 自研模块: read 内部已触发全新传输 (table_refresh), 不要再从用户态发 0x65 —
-        // 双发会与模块的六步握手竞争同一 SMN 桥/邮箱, 偶发超时 (实测 ~1/3 失败率)
-        println!("  经 rustinfo_smu 模块读取 {:#X} 字节 → {out}", b.len());
-        b
-    } else {
-        let (ret, _) = smn.send_command(RSP, CMD, ARGS, 0x65, [0; 6])?;
-        if ret != 0x01 {
-            bail!("传输命令返回 0x{ret:02X}");
-        }
-        let devmem = File::open("/dev/mem").context("打开 /dev/mem 失败")?;
-        let mut b = vec![0u8; len as usize];
-        if let Err(e) = devmem.read_exact_at(&mut b, base) {
-            bail!("/dev/mem 读取失败: {e} (IO_STRICT_DEVMEM 内核请先加载 module/rustinfo_smu.ko)");
-        }
-        println!("  已读取 {:#X} 字节 → {out}", b.len());
-        b
-    };
-    fs::write(out, &buf).with_context(|| format!("写 {out}"))?;
-
-    let f32v = |off: usize| f32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-    println!("\n已知偏移候选:");
-    println!("  0x7C VDDCR ≈ {:.1}", f32v(0x7C));
-    println!("\n前 0x80 字节 hexdump:");
-    for row in 0..8 {
-        let o = row * 16;
-        let hex: Vec<String> = buf[o..o + 16].iter().map(|b| format!("{b:02X}")).collect();
-        println!("  {o:04X}: {}  {}", hex.join(" "), hex_f32(&buf, o));
-    }
-    // 全表转储: "0xOFFSET value" 每行一个 f32, 供脚本 awk '$1 ~ /^0x/' 解析
-    // (替代 ryzenadj --dump-table; 0x007C=VDDCR, 0x0000/0x0008/0x0010=stapm/fast/slow limit)
-    println!("\n全表 f32 转储 ({} 字节):", buf.len());
-    for off in (0..buf.len() - 3).step_by(4) {
-        println!("0x{off:04X} {}", f32v(off));
-    }
-    println!("\n用 ryzenadj --dump-table 对照同偏移即可验证; 非零 float 密集区即遥测区。");
     Ok(())
 }
 
-fn hex_f32(buf: &[u8], off: usize) -> String {
-    let mut parts = Vec::new();
-    for i in 0..4 {
-        let o = off + i * 4;
-        let v = f32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
-        if v.abs() > 0.001 && v.is_finite() {
-            parts.push(format!("{o:04X}:{v:.2}"));
-        }
-    }
-    if parts.is_empty() {
-        "-".into()
+pub fn smu_table() -> Result<()> {
+    require_supported_cpu()?;
+    let module_table = std::path::Path::new("/sys/kernel/debug/rustinfo_smu/table");
+    let buf = if module_table.exists() {
+        // The module owns its mailbox transaction. Do not send competing PCI commands first.
+        let buf = fs::read(module_table).context("读取 rustinfo_smu 遥测表失败")?;
+        println!("经 rustinfo_smu 模块读取 {} 字节", buf.len());
+        buf
     } else {
-        parts.join(" ")
-    }
+        let smn = Smn::open(0xC4, 0xC8)?;
+        let version = smn.send_command(TABLE, 0x06, [0; 6])?.ensure_ok()?;
+        println!("pm_table 版本 0x{:06X}", version[0]);
+        let base_args = smn
+            .send_command(TABLE, 0x66, [1, 1, 0, 0, 0, 0])?
+            .ensure_ok()?;
+        let base = base_args[0] as u64 | ((base_args[1] as u64) << 32);
+        if base == 0 || base > 0x0000_8000_0000_0000 {
+            bail!("DRAM 基址异常: 0x{base:X}")
+        }
+        let map = fs::read_to_string("/proc/iomem").context("读 /proc/iomem")?;
+        let (label, available) = iomem_region(&map, base)?;
+        if label.to_ascii_lowercase().contains("system ram") {
+            bail!("目标落在 System RAM, 拒绝读取")
+        }
+        let size = available.min(0x1000) as usize;
+        if size < 0x100 {
+            bail!("SMU 保留区过小 ({size:#X})")
+        }
+        smn.send_command(TABLE, 0x65, [0; 6])?.ensure_ok()?;
+        let file = File::open("/dev/mem").context("打开 /dev/mem; 可改用 rustinfo_smu 模块")?;
+        let mut buf = vec![0; size];
+        file.read_exact_at(&mut buf, base)
+            .context("读取 SMU 保留区")?;
+        buf
+    };
+    dump_table(&buf)
 }
 
-/// 在 /proc/iomem 中定位物理地址所在区域, 返回 (标签, 从该地址到区域结束的字节数)
-fn iomem_region(base: u64) -> Result<(String, u64)> {
-    let s = fs::read_to_string("/proc/iomem").context("读 /proc/iomem (需 root)")?;
-    for line in s.lines() {
-        let Some((range, label)) = line.split_once(" : ") else { continue };
-        let Some((start, end)) = range.trim().split_once('-') else { continue };
-        let Ok(start) = u64::from_str_radix(start, 16) else { continue };
-        let Ok(end) = u64::from_str_radix(end, 16) else { continue };
+fn dump_table(buf: &[u8]) -> Result<()> {
+    if buf.len() < 0x80 {
+        bail!("SMU 遥测表被截断: {} 字节", buf.len())
+    }
+    let out = "/tmp/smu_pm_table.bin";
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(out)
+        .context("创建 SMU 表转储")?;
+    use std::io::Write;
+    output.write_all(buf)?;
+    println!(
+        "已写入 {out}; VDDCR 原始值 {:.1}",
+        f32::from_le_bytes(buf[0x7c..0x80].try_into()?)
+    );
+    for (row, bytes) in buf.as_chunks::<16>().0.iter().take(8).enumerate() {
+        println!(
+            "{:04X}: {}",
+            row * 16,
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    for (index, bytes) in buf.as_chunks::<4>().0.iter().enumerate() {
+        println!("0x{:04X} {}", index * 4, f32::from_le_bytes(*bytes));
+    }
+    Ok(())
+}
+
+fn iomem_region(text: &str, base: u64) -> Result<(String, u64)> {
+    let mut matches = Vec::new();
+    for line in text.lines() {
+        let Some((range, label)) = line.split_once(':') else {
+            continue;
+        };
+        let Some((start, end)) = range.trim().split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (u64::from_str_radix(start, 16), u64::from_str_radix(end, 16))
+        else {
+            continue;
+        };
         if start <= base && base <= end {
-            return Ok((label.trim().to_string(), end - base + 1));
+            matches.push((end.saturating_sub(start), label.trim(), end - base));
         }
     }
-    bail!("基址 0x{base:X} 不在任何 iomem 区域内")
+    let (_, label, remaining) = matches
+        .into_iter()
+        .min_by_key(|(size, _, _)| *size)
+        .context("SMU 基址不在 /proc/iomem 中")?;
+    Ok((label.into(), remaining.saturating_add(1)))
 }
 
 pub fn probe() -> Result<()> {
     require_supported_cpu()?;
-    println!("SMU 邮箱探针 — 只发只读命令 0x02 (GetSMUVersion), 命中即停");
-    for (idx_reg, data_reg) in SMN_BRIDGES {
-        let smn = match Smn::open(*idx_reg, *data_reg) {
-            Ok(s) => s,
-            Err(e) => {
-                println!("SMN 桥 0x{idx_reg:X}/0x{data_reg:X}: {e:#}");
-                continue;
-            }
-        };
-        println!("SMN 桥 config 0x{idx_reg:X}/0x{data_reg:X}:");
-        for (name, cmd, rsp, args) in MAILBOXES {
-            match smn.send_command(*rsp, *cmd, *args, 0x02, [1, 0, 0, 0, 0, 0]) {
-                Ok((ret, a)) => {
-                    println!("  {name:<9} RSP 0x{ret:02X}  arg0 0x{:08X}", a[0]);
-                    if ret == 0x01 && a[0] > 1 {
-                        let v = a[0];
-                        println!("  ✅ 命中: {name} — SMU 版本 {} (0x{v:08X})", version_str(v));
-                        return Ok(());
-                    }
+    let module_info = std::path::Path::new("/sys/kernel/debug/rustinfo_smu/info");
+    if module_info.exists() {
+        println!(
+            "rustinfo_smu 已加载:\n{}",
+            fs::read_to_string(module_info).context("读取模块信息")?
+        );
+        return Ok(());
+    }
+    println!("SMU 邮箱探针 (GetSMUVersion 0x02)");
+    for &(index, data) in SMN_BRIDGES {
+        let smn = Smn::open(index, data)?;
+        for &mailbox in MAILBOXES {
+            match smn.send_command(mailbox, 0x02, [1, 0, 0, 0, 0, 0]) {
+                Ok(reply) if reply.status == Status::Ok && reply.args[0] > 1 => {
+                    let version = reply.args[0];
+                    println!(
+                        "命中 {}: {}.{}.{} (0x{version:08X})",
+                        mailbox.name,
+                        (version >> 16) & 0xff,
+                        (version >> 8) & 0xff,
+                        version & 0xff
+                    );
+                    return Ok(());
                 }
-                Err(e) => println!("  {name:<9} {e:#}"),
+                Ok(reply) => println!("{}: {}", mailbox.name, reply.status),
+                Err(error) => println!("{}: {error:#}", mailbox.name),
             }
         }
     }
-    bail!("所有候选邮箱均未命中 — 固件可能用了新邮箱布局, 需要进一步逆向");
+    bail!("所有已知邮箱均未命中")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::{HashMap, VecDeque};
+    struct Fake {
+        responses: RefCell<VecDeque<u32>>,
+        writes: RefCell<Vec<(u32, u32)>>,
+        values: RefCell<HashMap<u32, u32>>,
+    }
+    impl Fake {
+        fn new(responses: &[u32]) -> Self {
+            Self {
+                responses: RefCell::new(responses.iter().copied().collect()),
+                writes: RefCell::new(Vec::new()),
+                values: RefCell::new(HashMap::new()),
+            }
+        }
+    }
+    impl RegisterIo for Fake {
+        fn read(&self, address: u32) -> Result<u32> {
+            if address == CONTROL.rsp {
+                Ok(self.responses.borrow_mut().pop_front().unwrap_or(0))
+            } else {
+                Ok(*self.values.borrow().get(&address).unwrap_or(&0))
+            }
+        }
+        fn write(&self, address: u32, value: u32) -> Result<()> {
+            self.writes.borrow_mut().push((address, value));
+            self.values.borrow_mut().insert(address, value);
+            Ok(())
+        }
+    }
+    fn timing() -> Timing {
+        Timing {
+            ready: Duration::ZERO,
+            response: Duration::ZERO,
+            poll: Duration::ZERO,
+        }
+    }
+    #[test]
+    fn mailbox_handshake_writes_all_arguments_before_the_command() {
+        let fake = Fake::new(&[1, 1]);
+        let reply = exchange(&fake, CONTROL, 0x4c, [0x0fffffe5, 0, 0, 0, 0, 0], &timing()).unwrap();
+        assert_eq!(reply.ensure_ok().unwrap()[0], 0x0fffffe5);
+        let writes = fake.writes.borrow();
+        assert_eq!(writes.len(), 8);
+        assert_eq!(writes[0], (CONTROL.rsp, 0));
+        assert_eq!(writes[1], (CONTROL.arg, 0x0fffffe5));
+        assert_eq!(writes[7], (CONTROL.msg, 0x4c));
+    }
+    #[test]
+    fn a_busy_initial_mailbox_performs_no_writes() {
+        let fake = Fake::new(&[0]);
+        assert!(exchange(&fake, CONTROL, 0x4c, [0; 6], &timing()).is_err());
+        assert!(fake.writes.borrow().is_empty());
+    }
+    #[test]
+    fn firmware_rejection_and_response_timeout_are_errors() {
+        for code in [0xff, 0xfe, 0xfd, 0xfc, 0xab] {
+            let fake = Fake::new(&[1, code]);
+            assert!(exchange(&fake, CONTROL, 0x4c, [0; 6], &timing())
+                .unwrap()
+                .ensure_ok()
+                .is_err());
+        }
+        assert!(exchange(&Fake::new(&[1, 0]), CONTROL, 0x4c, [0; 6], &timing()).is_err());
+    }
+    #[test]
+    fn reserved_child_regions_take_precedence_over_system_ram_parents() {
+        let (label, size) = iomem_region(
+            "00001000-00009fff : System RAM\n  00004000-00004fff : reserved\n",
+            0x4000,
+        )
+        .unwrap();
+        assert_eq!(label, "reserved");
+        assert_eq!(size, 0x1000);
+        assert!(iomem_region("", 0x4000).is_err());
+    }
+    #[test]
+    fn a_short_module_dump_returns_an_error_without_indexing_it() {
+        assert!(dump_table(&[0; 3]).is_err());
+    }
 }
