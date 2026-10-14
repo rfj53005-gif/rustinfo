@@ -12,13 +12,14 @@ use crate::model::{Snapshot, Unit};
 const BAR8: [char; 9] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
 
 fn bar8(pct: f64, width: usize) -> String {
-    let units = (pct / 100.0 * width as f64 * 8.0).round() as usize;
+    let units = (pct.clamp(0.0, 100.0) / 100.0 * width as f64 * 8.0).round() as usize;
     let full = (units / 8).min(width);
     let frac = units % 8;
     let mut s: String = "█".repeat(full);
     if full < width && frac > 0 {
         s.push(BAR8[frac]);
     }
+    s.push_str(&" ".repeat(width.saturating_sub(s.chars().count())));
     s
 }
 
@@ -115,6 +116,9 @@ impl History {
 }
 
 fn push_ring_cap(v: &mut VecDeque<u64>, val: u64, cap: usize) {
+    if cap == 0 {
+        return;
+    }
     if v.len() == cap {
         v.pop_front();
     }
@@ -122,23 +126,49 @@ fn push_ring_cap(v: &mut VecDeque<u64>, val: u64, cap: usize) {
 }
 
 fn find_tctl(s: &Snapshot) -> Option<f64> {
-    let k = s
-        .chips
-        .iter()
-        .find(|c| c.name.contains("k10temp") || c.name.contains("zenpower"))
-        .or_else(|| s.chips.first())?;
-    k.readings
-        .iter()
-        .find(|r| r.unit == Unit::TempC)
-        .map(|r| r.value)
+    for name in ["k10temp", "zenpower", "coretemp", "smu"] {
+        if let Some(chip) = s.chips.iter().find(|c| c.name.contains(name)) {
+            if let Some(reading) = chip
+                .readings
+                .iter()
+                .find(|r| {
+                    r.unit == Unit::TempC
+                        && matches!(
+                            r.label.to_ascii_lowercase().as_str(),
+                            "tctl" | "tdie" | "package id 0"
+                        )
+                })
+                .or_else(|| {
+                    chip.readings
+                        .iter()
+                        .find(|r| r.unit == Unit::TempC && !r.label.contains("limit"))
+                })
+            {
+                return Some(reading.value);
+            }
+        }
+    }
+    None
 }
 
 // ---------- 顶层绘制 ----------
 
-pub fn draw(f: &mut Frame, s: &Snapshot, hist: &History, paused: bool, interval: f64, log_path: Option<&str>) {
+pub fn draw(
+    f: &mut Frame,
+    s: &Snapshot,
+    hist: &History,
+    paused: bool,
+    interval: f64,
+    log_path: Option<&str>,
+    sensor_scroll: &mut u16,
+) {
     // CPU 面板高度随线程数自适应 (每列至多 12 线程, 至多 3 列), 避免高线程数机器被裁剪
     let n = s.cpu.per_mhz.len();
-    let cpu_cols = n.div_ceil(12).clamp(1, 3);
+    let available_cols = (f.area().width as usize * 58 / 100)
+        .saturating_sub(2)
+        .div_euclid(20)
+        .clamp(1, 3);
+    let cpu_cols = n.div_ceil(12).clamp(1, available_cols);
     let cpu_rows = (n.div_ceil(cpu_cols) + 2).max(4) as u16;
     let rows = Layout::vertical([
         Constraint::Length(1),
@@ -150,7 +180,7 @@ pub fn draw(f: &mut Frame, s: &Snapshot, hist: &History, paused: bool, interval:
     .split(f.area());
     draw_header(f, rows[0], s);
     draw_top(f, rows[1], s, cpu_cols);
-    draw_sensors(f, rows[2], s);
+    draw_sensors(f, rows[2], s, sensor_scroll);
     draw_charts(f, rows[3], hist);
     draw_footer(f, rows[4], paused, interval, log_path);
 }
@@ -173,7 +203,10 @@ fn draw_header(f: &mut Frame, area: Rect, s: &Snapshot) {
         dim(" │ 运行 "),
         Span::raw(fmt_uptime(s.uptime_s)),
         dim(" │ 负载 "),
-        Span::raw(format!("{:.2} {:.2} {:.2}", s.load[0], s.load[1], s.load[2])),
+        Span::raw(format!(
+            "{:.2} {:.2} {:.2}",
+            s.load[0], s.load[1], s.load[2]
+        )),
         dim(" │ "),
         Span::raw(format!("{t}")),
     ]);
@@ -181,12 +214,14 @@ fn draw_header(f: &mut Frame, area: Rect, s: &Snapshot) {
 }
 
 fn draw_top(f: &mut Frame, area: Rect, s: &Snapshot, cpu_cols: usize) {
-    let cols = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(area);
+    let cols =
+        Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(area);
 
     let cpu_block = panel(format!("CPU · {}", truncate(&s.cpu.model, 48)));
     let cpu_inner = cpu_block.inner(cols[0]);
     f.render_widget(cpu_block, cols[0]);
-    let tc = Layout::horizontal(vec![Constraint::Ratio(1, cpu_cols as u32); cpu_cols]).split(cpu_inner);
+    let tc =
+        Layout::horizontal(vec![Constraint::Ratio(1, cpu_cols as u32); cpu_cols]).split(cpu_inner);
     let per_col = s.cpu.per_mhz.len().div_ceil(cpu_cols);
     for (i, col) in tc.iter().enumerate() {
         let mut lines = Vec::new();
@@ -194,12 +229,22 @@ fn draw_top(f: &mut Frame, area: Rect, s: &Snapshot, cpu_cols: usize) {
             let pct = s.cpu.per_pct.get(t).copied().unwrap_or(0.0);
             let mhz = s.cpu.per_mhz[t];
             let color = usage_color(pct as f64);
-            lines.push(Line::from(vec![
-                Span::styled(format!("T{t:02} "), Style::default().fg(Color::DarkGray)),
+            let mut spans = vec![
+                Span::styled(
+                    format!("T{:02} ", s.cpu.ids.get(t).copied().unwrap_or(t)),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled(bar8(pct as f64, 8), Style::default().fg(color)),
                 Span::styled(format!(" {:>5.1}%", pct), Style::default().fg(color)),
-                Span::styled(format!(" {:>4.0}MHz", mhz), Style::default().fg(Color::DarkGray)),
-            ]));
+                Span::styled(
+                    format!(" {:>4.0}MHz", mhz),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
+            if col.width < 28 {
+                spans.pop();
+            }
+            lines.push(Line::from(spans));
         }
         f.render_widget(Paragraph::new(lines), *col);
     }
@@ -221,7 +266,10 @@ fn draw_top(f: &mut Frame, area: Rect, s: &Snapshot, cpu_cols: usize) {
     if let Some(w) = s.cpu.pkg_w {
         lines.push(Line::from(vec![
             dim("CPU功耗 "),
-            Span::styled(format!("{w:.2} W"), Style::default().fg(reading_color(&Unit::Watts, w))),
+            Span::styled(
+                format!("{w:.2} W"),
+                Style::default().fg(reading_color(&Unit::Watts, w)),
+            ),
         ]));
     }
     let used = s.mem.total_kib.saturating_sub(s.mem.avail_kib);
@@ -232,12 +280,13 @@ fn draw_top(f: &mut Frame, area: Rect, s: &Snapshot, cpu_cols: usize) {
     };
     lines.push(Line::from(vec![
         dim("内存 "),
-        Span::styled(
-            bar8(mem_pct, 12),
-            Style::default().fg(usage_color(mem_pct)),
-        ),
+        Span::styled(bar8(mem_pct, 12), Style::default().fg(usage_color(mem_pct))),
         Span::raw(format!(" {:>4.0}% ", mem_pct)),
-        dim(format!("{:.1}/{:.1}G", used as f64 / 1048576.0, s.mem.total_kib as f64 / 1048576.0)),
+        dim(format!(
+            "{:.1}/{:.1}G",
+            used as f64 / 1048576.0,
+            s.mem.total_kib as f64 / 1048576.0
+        )),
     ]));
     let swap_used = s.mem.swap_total_kib.saturating_sub(s.mem.swap_free_kib);
     lines.push(Line::from(vec![
@@ -281,7 +330,10 @@ fn draw_top(f: &mut Frame, area: Rect, s: &Snapshot, cpu_cols: usize) {
             dim("电池 "),
             Span::styled(bar8(cap, 10), Style::default().fg(batt_color)),
             Span::styled(format!(" {:>2.0}%", cap), Style::default().fg(batt_color)),
-            Span::styled(format!(" {}", batt_status_zh(&b.status)), Style::default().fg(batt_color)),
+            Span::styled(
+                format!(" {}", batt_status_zh(&b.status)),
+                Style::default().fg(batt_color),
+            ),
         ]));
         let mut l = vec![dim("      ")];
         if let Some(v) = b.volts {
@@ -291,7 +343,10 @@ fn draw_top(f: &mut Frame, area: Rect, s: &Snapshot, cpu_cols: usize) {
             l.push(Span::raw(format!("{a:.2}A ")));
         }
         if let Some(w) = b.watts {
-            l.push(Span::styled(format!("{:.1}W ", w.abs()), Style::default().fg(reading_color(&Unit::Watts, w.abs()))));
+            l.push(Span::styled(
+                format!("{:.1}W ", w.abs()),
+                Style::default().fg(reading_color(&Unit::Watts, w.abs())),
+            ));
         }
         if let (Some(en), Some(ef)) = (b.energy_now_wh, b.energy_full_wh) {
             l.push(dim(format!("{:.1}/{:.1}Wh", en, ef)));
@@ -300,7 +355,14 @@ fn draw_top(f: &mut Frame, area: Rect, s: &Snapshot, cpu_cols: usize) {
         let mut l = vec![dim("      ")];
         if let Some(h) = b.health_pct {
             l.push(dim("健康 "));
-            l.push(Span::styled(format!("{:.0}%", h), Style::default().fg(if h < 80.0 { Color::Yellow } else { Color::Green })));
+            l.push(Span::styled(
+                format!("{:.0}%", h),
+                Style::default().fg(if h < 80.0 {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                }),
+            ));
         }
         if let Some(m) = b.runtime_min {
             l.push(dim(format!("  续航 ~{}h{:02}m", m / 60, m % 60)));
@@ -310,8 +372,14 @@ fn draw_top(f: &mut Frame, area: Rect, s: &Snapshot, cpu_cols: usize) {
         }
     }
     match s.ac_online {
-        Some(true) => lines.push(Line::from(vec![dim("外接电源 "), Span::styled("在线", Style::default().fg(Color::Green))])),
-        Some(false) => lines.push(Line::from(vec![dim("外接电源 "), Span::styled("离线", Style::default().fg(Color::DarkGray))])),
+        Some(true) => lines.push(Line::from(vec![
+            dim("外接电源 "),
+            Span::styled("在线", Style::default().fg(Color::Green)),
+        ])),
+        Some(false) => lines.push(Line::from(vec![
+            dim("外接电源 "),
+            Span::styled("离线", Style::default().fg(Color::DarkGray)),
+        ])),
         None => {}
     }
     if !s.cpu.governor.is_empty() {
@@ -332,11 +400,11 @@ fn avg_mhz(s: &Snapshot) -> f32 {
     }
 }
 
-fn draw_sensors(f: &mut Frame, area: Rect, s: &Snapshot) {
+fn draw_sensors(f: &mut Frame, area: Rect, s: &Snapshot, scroll: &mut u16) {
     let block = panel(format!("传感器 · {} 芯片", s.chips.len()));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let ncols = if s.chips.len() > 12 { 4 } else { 3 };
+    let ncols = (inner.width as usize / 42).clamp(1, if s.chips.len() > 12 { 4 } else { 3 });
 
     // 每芯片先渲染成行 (smu 类芯片的每核 clk/W/VID 三读数压缩为一行),
     // 再按高度降序贪心装柱 (first-fit decreasing) — 轮转分配会让大芯片
@@ -356,12 +424,20 @@ fn draw_sensors(f: &mut Frame, area: Rect, s: &Snapshot) {
         cols[c].extend(lines);
     }
 
+    let max_scroll = heights
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    *scroll = (*scroll).min(max_scroll);
     let constraints: Vec<Constraint> = (0..ncols)
         .map(|_| Constraint::Ratio(1, ncols as u32))
         .collect();
     let rects = Layout::horizontal(constraints).split(inner);
     for (i, lines) in cols.into_iter().enumerate() {
-        f.render_widget(Paragraph::new(lines), rects[i]);
+        f.render_widget(Paragraph::new(lines).scroll((*scroll, 0)), rects[i]);
     }
 }
 
@@ -420,8 +496,9 @@ fn chip_lines(chip: &crate::model::Chip) -> Vec<Line<'static>> {
             let span = Span::styled(format!("{text:>10}"), Style::default().fg(color));
             match col_of(kind).and_then(|i| kinds.iter().position(|&k| k == i)) {
                 Some(dense) => {
-                    cores.entry(c.to_string()).or_insert_with(|| vec![None; nslots])[dense] =
-                        Some(span)
+                    cores
+                        .entry(c.to_string())
+                        .or_insert_with(|| vec![None; nslots])[dense] = Some(span)
                 }
                 None => misc_cores.entry(c.to_string()).or_default().push(span),
             }
@@ -464,7 +541,15 @@ fn draw_charts(f: &mut Frame, area: Rect, hist: &History) {
     chart(f, cols[2], &hist.mem, Color::Green, "内存", 10.0, "%");
 }
 
-fn chart(f: &mut Frame, area: Rect, data: &VecDeque<u64>, color: Color, name: &str, scale: f64, unit: &str) {
+fn chart(
+    f: &mut Frame,
+    area: Rect,
+    data: &VecDeque<u64>,
+    color: Color,
+    name: &str,
+    scale: f64,
+    unit: &str,
+) {
     let v: Vec<u64> = data.iter().copied().collect();
     let title = match (v.last(), v.iter().max()) {
         (Some(last), Some(max)) => format!(
@@ -498,6 +583,8 @@ fn draw_footer(f: &mut Frame, area: Rect, paused: bool, interval: f64, log_path:
         key("l CSV"),
         Span::raw(" "),
         key("+/- 间隔"),
+        Span::raw(" "),
+        key("PgUp/Dn 滚动"),
         Span::raw("  "),
         dim(format!("采样 {:.1}s ", interval)),
     ];
@@ -545,5 +632,77 @@ pub fn batt_status_zh(s: &str) -> &'static str {
         "Full" => "已满",
         "Not charging" => "未充电",
         _ => "未知",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Chip, Reading};
+    use ratatui::{backend::TestBackend, Terminal};
+    fn reading(label: &str, value: f64, unit: Unit) -> Reading {
+        Reading {
+            key: None,
+            label: label.into(),
+            value,
+            unit,
+        }
+    }
+    #[test]
+    fn cpu_history_does_not_mistake_a_drive_temperature_or_a_limit_for_cpu_temperature() {
+        let mut snapshot = Snapshot::default();
+        snapshot.chips.push(Chip {
+            id: "drive".into(),
+            name: "nvme".into(),
+            readings: vec![reading("Composite", 40.0, Unit::TempC)],
+        });
+        assert_eq!(find_tctl(&snapshot), None);
+        snapshot.chips.push(Chip {
+            id: "smu".into(),
+            name: "smu".into(),
+            readings: vec![
+                reading("tctl_limit", 95.0, Unit::TempC),
+                reading("tctl", 50.0, Unit::TempC),
+            ],
+        });
+        assert_eq!(find_tctl(&snapshot), Some(50.0));
+    }
+    #[test]
+    fn narrow_terminals_and_scrolling_do_not_panic_or_keep_an_out_of_range_offset() {
+        let mut snapshot = Snapshot::default();
+        snapshot.cpu.ids = (0..20).collect();
+        snapshot.cpu.per_mhz = vec![2000.0; 20];
+        snapshot.cpu.per_pct = vec![50.0; 20];
+        snapshot.chips.push(Chip {
+            id: "many".into(),
+            name: "many sensors".into(),
+            readings: (0..100)
+                .map(|i| reading(&format!("sensor{i}"), i as f64, Unit::Watts))
+                .collect(),
+        });
+        let history = History::new(10);
+        for (width, height) in [(0, 0), (20, 8), (80, 24), (160, 50)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut scroll = u16::MAX;
+            terminal
+                .draw(|f| draw(f, &snapshot, &history, false, 1.0, None, &mut scroll))
+                .unwrap();
+            assert!(scroll < u16::MAX);
+            if width >= 80 && height >= 24 {
+                assert!(format!("{}", terminal.backend()).contains("T19"));
+            }
+        }
+    }
+    #[test]
+    fn a_zero_capacity_history_stays_empty() {
+        let mut history = History::new(0);
+        history.push(&Snapshot::default());
+        assert!(history.mem.is_empty());
+    }
+    #[test]
+    fn cpu_percentage_columns_stay_aligned_at_idle_and_full_load() {
+        for pct in [0.0, 12.5, 50.0, 100.0, 150.0] {
+            assert_eq!(bar8(pct, 8).chars().count(), 8);
+        }
     }
 }

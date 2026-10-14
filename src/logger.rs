@@ -1,147 +1,318 @@
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
-use std::process::Command;
-
+//! CSV columns are bound to source identities, not potentially duplicate display labels.
+use crate::model::{Snapshot, Unit};
 use anyhow::{Context, Result};
 use chrono::Local;
+use std::collections::{HashMap, HashSet};
+use std::io::{self, Write};
 
-use crate::model::Snapshot;
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ColumnKey {
+    System(String),
+    Sensor {
+        chip: String,
+        attribute: String,
+        unit: Unit,
+    },
+}
+struct Field {
+    key: ColumnKey,
+    name: String,
+    value: String,
+}
+struct Column {
+    key: ColumnKey,
+    name: String,
+}
+struct Schema {
+    columns: Vec<Column>,
+}
 
-/// root 运行时把新建的 CSV 归还给发起 sudo 的用户, 避免 root 属主文件散落
-fn chown_to_sudo_user(path: &str) {
-    let Some(user) = std::env::var("SUDO_USER").ok() else {
-        return;
-    };
-    let uid = Command::new("id")
-        .args(["-u", &user])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok());
-    let Some(uid) = uid else { return };
-    let gid = Command::new("id")
-        .args(["-g", &user])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok());
-    let _ = std::os::unix::fs::chown(path, Some(uid), gid);
+impl Schema {
+    fn new(snapshot: &Snapshot) -> Self {
+        let mut names = HashSet::new();
+        let columns = fields(snapshot)
+            .into_iter()
+            .map(|field| {
+                let mut name = field.name.clone();
+                let mut suffix = 2;
+                while !names.insert(name.clone()) {
+                    name = format!("{}#{suffix}", field.name);
+                    suffix += 1;
+                }
+                Column {
+                    key: field.key,
+                    name,
+                }
+            })
+            .collect();
+        Self { columns }
+    }
+    fn row(&self, snapshot: &Snapshot) -> Vec<String> {
+        let values = fields(snapshot)
+            .into_iter()
+            .map(|field| (field.key, field.value))
+            .collect::<HashMap<_, _>>();
+        self.columns
+            .iter()
+            .map(|column| values.get(&column.key).cloned().unwrap_or_default())
+            .collect()
+    }
 }
 
 pub struct Logger {
-    file: File,
-    header: Vec<String>,
+    file: crate::csv_writer::Output,
+    schema: Schema,
     path: String,
 }
-
 impl Logger {
-    pub fn create(snap: &Snapshot, path: Option<&str>) -> Result<Self> {
-        let path = match path {
-            Some(p) => p.to_string(),
-            None => format!("rustinfo_{}.csv", Local::now().format("%Y%m%d_%H%M%S")),
-        };
-        let header: Vec<String> = flatten(snap).into_iter().map(|(k, _)| k).collect();
-        let mut file = File::create(&path).with_context(|| format!("无法创建 {path}"))?;
-        writeln!(file, "{}", header.join(","))?;
-        chown_to_sudo_user(&path);
-        Ok(Self { file, header, path })
+    pub fn create(snapshot: &Snapshot, path: Option<&str>) -> Result<Self> {
+        let generated = path.is_none();
+        let path = path
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("rustinfo_{}.csv", Local::now().format("%Y%m%d_%H%M%S_%f")));
+        let schema = Schema::new(snapshot);
+        let mut file = crate::csv_writer::Output::open(&path, generated)?;
+        write_record(
+            &mut file,
+            schema.columns.iter().map(|column| column.name.as_str()),
+        )?;
+        file.flush()?;
+        Ok(Self { file, schema, path })
     }
-
-    pub fn write(&mut self, snap: &Snapshot) -> Result<()> {
-        let map: HashMap<String, String> = flatten(snap).into_iter().collect();
-        let row: Vec<String> = self
-            .header
-            .iter()
-            .map(|k| map.get(k).cloned().unwrap_or_default())
-            .collect();
-        writeln!(self.file, "{}", row.join(","))?;
+    pub fn write(&mut self, snapshot: &Snapshot) -> Result<()> {
+        let row = self.schema.row(snapshot);
+        write_record(&mut self.file, row.iter().map(String::as_str))
+            .with_context(|| format!("写入 {} 失败", self.path))?;
         self.file.flush()?;
         Ok(())
     }
-
+    pub fn finish(&mut self) -> Result<()> {
+        self.file.finish().context("刷新 CSV 失败")
+    }
     pub fn path(&self) -> &str {
         &self.path
     }
-
-    pub fn finish(&mut self) -> Result<()> {
-        self.file.flush()?;
-        Ok(())
-    }
 }
 
-fn sanitize(s: &str) -> String {
-    s.chars()
+fn write_record<'a>(
+    writer: &mut impl Write,
+    values: impl IntoIterator<Item = &'a str>,
+) -> io::Result<()> {
+    for (index, value) in values.into_iter().enumerate() {
+        if index > 0 {
+            writer.write_all(b",")?;
+        }
+        if value.contains([',', '"', '\n', '\r']) {
+            write!(writer, "\"{}\"", value.replace('"', "\"\""))?;
+        } else {
+            writer.write_all(value.as_bytes())?;
+        }
+    }
+    writer.write_all(b"\n")
+}
+fn sanitize(value: &str) -> String {
+    value
+        .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
 }
 
-pub fn flatten(s: &Snapshot) -> Vec<(String, String)> {
+fn fields(snapshot: &Snapshot) -> Vec<Field> {
     let mut out = Vec::new();
-    out.push((
+    let mut system = |name: String, value: String| {
+        out.push(Field {
+            key: ColumnKey::System(name.clone()),
+            name,
+            value,
+        })
+    };
+    system(
         "ts".into(),
-        s.time.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
-    ));
-    out.push(("cpu_total_pct".into(), format!("{:.2}", s.cpu.total_pct)));
-    if let Some(w) = s.cpu.pkg_w {
-        out.push(("cpu_pkg_w".into(), format!("{:.3}", w)));
+        snapshot.time.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+    );
+    system(
+        "cpu_total_pct".into(),
+        format!("{:.2}", snapshot.cpu.total_pct),
+    );
+    system(
+        "cpu_pkg_w".into(),
+        snapshot
+            .cpu
+            .pkg_w
+            .map(|v| format!("{v:.3}"))
+            .unwrap_or_default(),
+    );
+    for (i, pct) in snapshot.cpu.per_pct.iter().enumerate() {
+        let id = snapshot.cpu.ids.get(i).copied().unwrap_or(i);
+        system(format!("t{id:02}_pct"), format!("{pct:.2}"));
     }
-    for (i, p) in s.cpu.per_pct.iter().enumerate() {
-        out.push((format!("t{i:02}_pct"), format!("{:.2}", p)));
+    for (i, mhz) in snapshot.cpu.per_mhz.iter().enumerate() {
+        let id = snapshot.cpu.ids.get(i).copied().unwrap_or(i);
+        system(format!("t{id:02}_mhz"), format!("{mhz:.0}"));
     }
-    for (i, m) in s.cpu.per_mhz.iter().enumerate() {
-        out.push((format!("t{i:02}_mhz"), format!("{:.0}", m)));
-    }
-    let used = s.mem.total_kib.saturating_sub(s.mem.avail_kib);
-    let mem_pct = if s.mem.total_kib > 0 {
-        used as f64 / s.mem.total_kib as f64 * 100.0
+    let used = snapshot
+        .mem
+        .total_kib
+        .saturating_sub(snapshot.mem.avail_kib);
+    let percentage = if snapshot.mem.total_kib > 0 {
+        used as f64 / snapshot.mem.total_kib as f64 * 100.0
     } else {
         0.0
     };
-    out.push(("mem_used_pct".into(), format!("{:.2}", mem_pct)));
-    out.push(("mem_used_mib".into(), format!("{:.1}", used as f64 / 1024.0)));
-    out.push((
+    system("mem_used_pct".into(), format!("{percentage:.2}"));
+    system(
+        "mem_used_mib".into(),
+        format!("{:.1}", used as f64 / 1024.0),
+    );
+    system(
         "swap_used_mib".into(),
         format!(
             "{:.1}",
-            s.mem.swap_total_kib.saturating_sub(s.mem.swap_free_kib) as f64 / 1024.0
+            snapshot
+                .mem
+                .swap_total_kib
+                .saturating_sub(snapshot.mem.swap_free_kib) as f64
+                / 1024.0
         ),
-    ));
-    out.push(("load1".into(), format!("{:.3}", s.load[0])));
-    if let Some(b) = &s.battery {
-        if let Some(v) = b.capacity_pct {
-            out.push(("batt_pct".into(), format!("{:.0}", v)));
-        }
-        if let Some(v) = b.volts {
-            out.push(("batt_v".into(), format!("{:.3}", v)));
-        }
-        if let Some(v) = b.amps {
-            out.push(("batt_a".into(), format!("{:.3}", v)));
-        }
-        if let Some(v) = b.watts {
-            out.push(("batt_w".into(), format!("{v:.3}")));
-        }
-        if let Some(v) = b.health_pct {
-            out.push(("batt_health_pct".into(), format!("{v:.1}")));
-        }
-        if let Some(m) = b.runtime_min {
-            out.push(("batt_runtime_min".into(), format!("{m}")));
-        }
+    );
+    system("load1".into(), format!("{:.3}", snapshot.load[0]));
+    let battery = snapshot.battery.as_ref();
+    for (name, value, precision) in [
+        ("batt_pct", battery.and_then(|b| b.capacity_pct), 0),
+        ("batt_v", battery.and_then(|b| b.volts), 3),
+        ("batt_a", battery.and_then(|b| b.amps), 3),
+        ("batt_w", battery.and_then(|b| b.watts), 3),
+        ("batt_health_pct", battery.and_then(|b| b.health_pct), 1),
+    ] {
+        system(
+            name.into(),
+            value
+                .map(|v| format!("{v:.precision$}"))
+                .unwrap_or_default(),
+        );
     }
-    if let Some(v) = &s.vram {
-        out.push(("vram_used_mib".into(), format!("{:.0}", v.used_mib)));
-        out.push(("vram_total_mib".into(), format!("{:.0}", v.total_mib)));
+    system(
+        "batt_runtime_min".into(),
+        battery
+            .and_then(|b| b.runtime_min)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    );
+    for (name, value) in [
+        ("vram_used_mib", snapshot.vram.as_ref().map(|v| v.used_mib)),
+        (
+            "vram_total_mib",
+            snapshot.vram.as_ref().map(|v| v.total_mib),
+        ),
+    ] {
+        system(
+            name.into(),
+            value.map(|v| format!("{v:.0}")).unwrap_or_default(),
+        );
     }
-    for chip in &s.chips {
-        for r in &chip.readings {
-            out.push((
-                format!(
+    for chip in &snapshot.chips {
+        for reading in &chip.readings {
+            out.push(Field {
+                key: ColumnKey::Sensor {
+                    chip: chip.id.clone(),
+                    attribute: reading.key.as_ref().unwrap_or(&reading.label).clone(),
+                    unit: reading.unit,
+                },
+                name: format!(
                     "{}.{}_{}",
                     sanitize(&chip.name),
-                    sanitize(&r.label),
-                    r.unit.csv_suffix()
+                    sanitize(&reading.label),
+                    reading.unit.csv_suffix()
                 ),
-                format!("{:.3}", r.value),
-            ));
+                value: if reading.value.is_finite() {
+                    format!("{:.3}", reading.value)
+                } else {
+                    String::new()
+                },
+            });
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Chip, Reading};
+    fn chip(id: &str, value: f64) -> Chip {
+        Chip {
+            id: id.into(),
+            name: "nvme".into(),
+            readings: vec![Reading {
+                key: Some("temp1_input".into()),
+                label: "Composite".into(),
+                value,
+                unit: Unit::TempC,
+            }],
+        }
+    }
+    #[test]
+    fn identical_device_names_never_overwrite_or_shift_csv_values() {
+        let mut snapshot = Snapshot {
+            chips: vec![chip("drive-a", 30.0), chip("drive-b", 40.0)],
+            ..Snapshot::default()
+        };
+        let schema = Schema::new(&snapshot);
+        let a = schema
+            .columns
+            .iter()
+            .position(|column| column.name == "nvme.Composite_C")
+            .unwrap();
+        let b = schema
+            .columns
+            .iter()
+            .position(|column| column.name == "nvme.Composite_C#2")
+            .unwrap();
+        snapshot.chips = vec![chip("drive-b", 45.0)];
+        let row = schema.row(&snapshot);
+        assert_eq!(row[a], "");
+        assert_eq!(row[b], "45.000");
+    }
+    #[test]
+    fn optional_system_fields_have_columns_even_when_the_first_read_is_missing() {
+        let mut snapshot = Snapshot::default();
+        let schema = Schema::new(&snapshot);
+        let pkg = schema
+            .columns
+            .iter()
+            .position(|column| column.name == "cpu_pkg_w")
+            .unwrap();
+        snapshot.cpu.pkg_w = Some(12.5);
+        assert_eq!(schema.row(&snapshot)[pkg], "12.500");
+    }
+    #[test]
+    fn sparse_cpu_ids_survive_csv_export() {
+        let mut snapshot = Snapshot::default();
+        snapshot.cpu.ids = vec![2, 10];
+        snapshot.cpu.per_pct = vec![5.0, 8.0];
+        let schema = Schema::new(&snapshot);
+        assert!(schema.columns.iter().any(|column| column.name == "t10_pct"));
+        assert!(!schema.columns.iter().any(|column| column.name == "t00_pct"));
+    }
+    #[test]
+    fn a_real_csv_file_keeps_a_rectangular_schema_when_a_device_disappears() {
+        let fixture = crate::test_support::Fixture::new();
+        let path = fixture.path().join("log.csv");
+        let mut snapshot = Snapshot {
+            chips: vec![chip("drive-a", 30.0)],
+            ..Snapshot::default()
+        };
+        let mut logger = Logger::create(&snapshot, Some(path.to_str().unwrap())).unwrap();
+        logger.write(&snapshot).unwrap();
+        snapshot.chips.clear();
+        logger.write(&snapshot).unwrap();
+        logger.finish().unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        let widths = text
+            .lines()
+            .map(|line| line.split(',').count())
+            .collect::<Vec<_>>();
+        assert_eq!(widths.len(), 3);
+        assert!(widths.iter().all(|width| *width == widths[0]));
+    }
 }
