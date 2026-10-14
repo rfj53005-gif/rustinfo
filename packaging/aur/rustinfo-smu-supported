@@ -1,0 +1,13 @@
+#!/bin/sh
+# Match the validated Strix Point CPU model, before any SMU mailbox access.
+awk -F: '
+    /^vendor_id[[:space:]]*:/ { vendor = $2; gsub(/[[:space:]]/, "", vendor) }
+    /^cpu family[[:space:]]*:/ { family = $2 + 0 }
+    /^model[[:space:]]*:/ { model = $2 + 0; found = 1; exit }
+    END { exit !(found && vendor == "AuthenticAMD" && family == 26 && model == 36) }
+' /proc/cpuinfo || exit 1
+
+if [ -d /sys/module/ryzen_smu ]; then
+    echo 'rustinfo: ryzen_smu is loaded; stop that driver before starting rustinfo-smu.service' >&2
+    exit 255
+fi

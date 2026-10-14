@@ -1,0 +1,14 @@
+[Unit]
+Description=Read-only rustinfo SMU telemetry on AMD Strix Point
+Wants=sys-kernel-debug.mount
+After=systemd-modules-load.service sys-kernel-debug.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecCondition=/usr/lib/rustinfo/smu-supported
+ExecStart=/usr/bin/modprobe msr
+ExecStart=/usr/bin/modprobe rustinfo_smu
+
+[Install]
+WantedBy=multi-user.target

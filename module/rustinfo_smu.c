@@ -18,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/string.h>
+#include <asm/processor.h>
 
 #define SMN_ADDR_REG 0xC4
 #define SMN_DATA_REG 0xC8
@@ -316,6 +317,14 @@ static int __init rustinfo_smu_init(void)
 	static const u32 zero[6];
 	u32 out[6];
 	int i, ret;
+
+	/* This mailbox/table layout is validated only on Strix Point (1Ah, 24h). */
+	if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD ||
+	    boot_cpu_data.x86 != 0x1A ||
+	    boot_cpu_data.x86_model != 0x24) {
+		pr_info("rustinfo_smu: unsupported CPU, requires AMD Strix Point\n");
+		return -ENODEV;
+	}
 
 	smn_pdev = pci_get_domain_bus_and_slot(0, 0, PCI_DEVFN(0, 0));
 	if (!smn_pdev) {

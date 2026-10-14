@@ -1,0 +1,39 @@
+pkgbase = rustinfo-git
+	pkgdesc = Linux hardware monitor with a terminal dashboard and AMD SMU control
+	pkgver = 0.2.0.r18.gd1ba5f3
+	pkgrel = 1
+	url = https://github.com/rfj53005-gif/rustinfo
+	arch = x86_64
+	license = MIT
+	makedepends = git
+	makedepends = cargo
+	options = !lto
+	options = !debug
+	source = rustinfo::git+https://github.com/rfj53005-gif/rustinfo.git
+	sha256sums = SKIP
+
+pkgname = rustinfo-git
+	depends = gcc-libs
+	depends = glibc
+	optdepends = rustinfo-smu-dkms: SMU telemetry on AMD Strix Point
+	provides = rustinfo=0.2.0.r18.gd1ba5f3
+	conflicts = rustinfo
+
+pkgname = rustinfo-smu-dkms-git
+	pkgdesc = Read-only AMD Strix Point SMU telemetry module sources for DKMS
+	license = GPL-2.0-only
+	depends = dkms
+	depends = clang
+	depends = llvm
+	depends = lld
+	optdepends = linux-headers: headers matching the installed kernel (or its custom kernel variant)
+	provides = rustinfo-smu-dkms=0.2.0.r18.gd1ba5f3
+	conflicts = rustinfo-smu-dkms
+
+pkgname = rustinfo-full-git
+	pkgdesc = Complete hardware monitor and automatic Strix Point SMU telemetry setup
+	depends = rustinfo-git=0.2.0.r18.gd1ba5f3-1
+	depends = rustinfo-smu-dkms-git=0.2.0.r18.gd1ba5f3-1
+	depends = systemd
+	depends = kmod
+	depends = gawk
